@@ -1,0 +1,10 @@
+{
+  "section_url": "https://lisp.land.moi.gov.tw/MMS/Handle/DownloadQuerySection.ashx?DownloadType=xls",
+  "landno_pattern": "^\\d{1,4}(-\\d{1,4})?$",
+  "api_land_info_url": "https://api.nlsc.gov.tw/S09_Ralid/getLandInfoSect",
+  "api_tile_index_url": "https://landmaps.nlsc.gov.tw/S_Maps/qryTileMapIndex",
+  "api_location_query_url": "https://api.nlsc.gov.tw/MapSearch/LocationQuery",
+  "api_referer": "https://maps.nlsc.gov.tw/",
+  "api_request_timeout": 20,
+  "api_request_delay": 0.5
+}

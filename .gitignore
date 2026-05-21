@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+*.spec
+venv/
+.venv/
+
+# Excel 暫存（開啟時）
+~$*
+
+# 使用者個人資料（測試用輸入/輸出，不上版控避免暴露查詢內容）
+input.xlsx
+input_sample.xlsx
+查詢結果.xlsx
+查詢結果*.xlsx
+查詢結果_API*.xlsx
+查詢結果_API_簡化版*.xlsx
+
+# 個人調整範本（過時、由腳本產出）
+欄位調整範本.xlsx
+
+# API 第一筆範例 dump（含真實查詢資料，個人參考用）
+API_第一筆_範例.md
+API_第一筆_範例.json
+
+# API 欄位對照表（個人參考、隨欄位調整會過時）
+api_field_mapping.md
+
+# IDE
+.vscode/
+.idea/
+
+# 環境變數
+.env
+.env.local
