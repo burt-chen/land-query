@@ -312,6 +312,46 @@ RALID_FIELD_MAP = {
 }
 
 
+# lcdetype.lcde_* 的代碼 → 中文類別 + 對應的 JSON key 清單
+# （類別 1「本國人」由 m/f/o 三個子分類加總而成）
+LCDETYPE_CATEGORIES = [
+    ("1", "本國人",      ["lcde_1_m", "lcde_1_f", "lcde_1_o"]),
+    ("2", "外國人",      ["lcde_2"]),
+    ("3", "國有",        ["lcde_3"]),
+    ("4", "省市有",      ["lcde_4"]),
+    ("5", "縣市有",      ["lcde_5"]),
+    ("6", "鄉鎮市有",    ["lcde_6"]),
+    ("7", "本國私法人",  ["lcde_7"]),
+    ("8", "外國法人",    ["lcde_8"]),
+    ("9", "祭祀公業",    ["lcde_9"]),
+    ("a", "其他",        ["lcde_a"]),
+    ("b", "銀行法人",    ["lcde_b"]),
+    ("c", "未知類別(c)", ["lcde_c"]),
+    ("d", "大陸地區法人", ["lcde_d"]),
+]
+
+
+def _format_owner_type_breakdown(lcdetype: dict) -> str:
+    """把 lcdetype 的所有權人類別比例串成單一字串。
+
+    例如：「本國人:63.77%外國人:4.76%國有:31.47%」
+    只列出比例 > 0 的類別；類別 1「本國人」由 m/f/o 三個子分類加總。
+    """
+    if not lcdetype:
+        return ""
+    parts: list[str] = []
+    for _code, name, keys in LCDETYPE_CATEGORIES:
+        total = 0.0
+        for k in keys:
+            try:
+                total += float(lcdetype.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        if total > 0:
+            parts.append(f"{name}:{total * 100:.2f}%")
+    return "".join(parts)
+
+
 # =============================================================================
 # 「簡化版匯出」設定 — 對應「欄位調整範本.xlsx」工作表2 的 32 欄
 # =============================================================================
@@ -374,19 +414,17 @@ EXPORT_COLUMNS_TEMPLATE = [
     {"name": "輸入小段",          "source": "輸入小段"},
     {"name": "輸入地號",          "source": "輸入地號"},
     {"name": "面積",              "source": "面積(平方公尺)"},
-    {"name": "使用分區",          "source": None},
-    {"name": "使用地類別",        "source": None},
+    {"name": "使用分區",          "source": "使用分區"},
+    {"name": "使用地類別",        "source": "使用地類別"},
     {"name": "登記日期",          "source": "登記日期",       "transform": "minguo_date"},
-    {"name": "公告土地現值",      "source": "申報地價",       "transform": "yuan_per_sqm"},
-    {"name": "權利人類別",        "source": None},
+    {"name": "公告現值",          "source": "申報地價",                "transform": "yuan_per_sqm"},
+    {"name": "公告地價",          "source": "公告土地現值(元/㎡)",     "transform": "yuan_per_sqm"},
+    {"name": "權利人類別",        "source": "權利人類別"},
     {"name": "地籍連結",          "source": "地籍連結(JSONP)"},
     {"name": "行政區",            "source": "行政區"},
     {"name": "經緯度(度)",        "source": "經緯度(JSONP)"},
     {"name": "經緯度(度分秒)",    "source": "經緯度(度分秒)"},
-    {"name": "TWD97",             "source": "TWD97"},  # pyproj 從 cx,cy 換算，格式 "E:xxx N:xxx"
     {"name": "地號",              "source": "地號(JSONP組合)"},
-    {"name": "登記日期_1",        "source": None},
-    {"name": "登記原因",          "source": None},
     {"name": "所有權人",          "source": "所有人_姓名"},
     {"name": "統一編號",          "source": "所有人_身分證號"},
     {"name": "所有權人類別",      "source": "所有人_類型"},
@@ -475,22 +513,6 @@ def _parse_location_query(text: str) -> dict:
     return result
 
 
-def _wgs84_to_twd97(lon: float, lat: float) -> tuple[float, float] | None:
-    """WGS84 (EPSG:4326) → TWD97 (EPSG:3826)。pyproj 沒裝就回 None。"""
-    try:
-        from pyproj import Transformer
-    except ImportError:
-        return None
-    try:
-        global _TWD97_TRANSFORMER
-        if _TWD97_TRANSFORMER is None:
-            _TWD97_TRANSFORMER = Transformer.from_crs("EPSG:4326", "EPSG:3826", always_xy=True)
-        e, n = _TWD97_TRANSFORMER.transform(lon, lat)
-        return e, n
-    except Exception:
-        return None
-
-
 def _api_format_land_record(
     row: "PreparedRow",
     payload: dict,
@@ -510,10 +532,18 @@ def _api_format_land_record(
         col = RALID_FIELD_MAP.get(k, k)
         data[col] = v
 
-    # lcdetype（土地使用分類比例）— 全攤平，給技術讀者用
+    # land 區塊的 AA11/AA12 是中文版「使用分區 / 使用地類別」
+    # （ralid 區塊的 AA11/AA12 是同樣兩個欄位的 base64 編碼，不用）
+    land_block = payload.get("land") or {}
+    data["使用分區"] = land_block.get("AA11", "")
+    data["使用地類別"] = land_block.get("AA12", "")
+
+    # lcdetype 其實是「所有權人類別面積比例」，不是土地使用分類
     lcdetype = payload.get("lcdetype") or {}
     for k, v in lcdetype.items():
         data[f"lcdetype.{k}"] = v
+    # 組成 Excel「權利人類別」欄用的字串
+    data["權利人類別"] = _format_owner_type_breakdown(lcdetype)
 
     # 所有人清單（取代「公有土地」）
     user_list = ((payload.get("land") or {}).get("userList")) or []
@@ -553,18 +583,10 @@ def _api_format_land_record(
     if not data.get("行政區") and (row.輸入縣市 or row.輸入行政區):
         data["行政區"] = f"{row.輸入縣市}{row.輸入行政區}"
 
-    # TWD97 座標（從 tile_index 的 cx,cy 換算）
+    # 經緯度(度) 若 LocationQuery 沒給就從 tile_index 的 cx,cy 直接組
     if tile_index and "cx" in tile_index and "cy" in tile_index:
-        cx, cy = tile_index["cx"], tile_index["cy"]
-        # 經緯度(度) 若 LocationQuery 沒給就從 cx,cy 直接組
         if not data.get("經緯度(度)"):
-            data["經緯度(度)"] = f"{cx},{cy}"
-        twd97 = _wgs84_to_twd97(cx, cy)
-        if twd97:
-            e, n = twd97
-            data["TWD97_E"] = f"{e:.2f}"
-            data["TWD97_N"] = f"{n:.2f}"
-            data["TWD97"] = f"E:{int(round(e))} N:{int(round(n))}"
+            data["經緯度(度)"] = f"{tile_index['cx']},{tile_index['cy']}"
 
     # 從 tile_index 組出 3 個衍生字串欄位（給 EXPORT_COLUMNS_TEMPLATE 用）
     if tile_index:
@@ -596,10 +618,6 @@ def _api_format_land_record(
     return data
 
 
-# Lazy-init 模組級 transformer，避免每筆都建立一次（昂貴）
-_TWD97_TRANSFORMER = None
-
-
 def run_api_query(
     rows: list[PreparedRow],
     cfg: dict,
@@ -610,9 +628,8 @@ def run_api_query(
 ) -> list[dict]:
     """純 API 查詢，每筆會打 3 顆 API：
       1. getLandInfoSect — 土地基本資訊 + 所有人 + 公有土地
-      2. qryTileMapIndex — 地塊中心經緯度（給 LocationQuery 用、pyproj 換 TWD97）
+      2. qryTileMapIndex — 地塊中心經緯度（給 LocationQuery 用）
       3. LocationQuery — 行政區 + 經緯度(度/度分秒) + 國土利用
-      + pyproj 把 WGS84 換成 TWD97
     """
     import requests
     import urllib3
@@ -930,10 +947,10 @@ class App:
         "查詢狀態": 240,
         "輸入縣市": 80, "輸入行政區": 90, "輸入大段": 100, "輸入小段": 70, "輸入地號": 80,
         "面積": 80, "使用分區": 80, "使用地類別": 100,
-        "登記日期": 150, "公告土地現值": 150, "權利人類別": 100,
+        "登記日期": 150, "公告現值": 130, "公告地價": 130, "權利人類別": 100,
         "地籍連結": 320, "行政區": 200,
-        "經緯度(度)": 180, "經緯度(度分秒)": 200, "TWD97": 130,
-        "地號": 280, "登記日期_1": 110, "登記原因": 90,
+        "經緯度(度)": 180, "經緯度(度分秒)": 200,
+        "地號": 280,
         "所有權人": 130, "統一編號": 120, "所有權人類別": 100, "權利範圍類別": 100,
         "權利範圍持分_分母": 120, "權利範圍持分_分子": 120,
         "申報地價": 150, "管理者名稱": 200,
