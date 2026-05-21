@@ -58,7 +58,6 @@ SAMPLE_INPUT_ROWS = [
     ("高雄市", "小港區", "港和段", "二小段", "447"),
     ("高雄市", "楠梓區", "藍田西段", "三小段", "2"),
 ]
-INPUT_OUTPUT_COLUMNS = ["輸入縣市", "輸入行政區", "輸入大段", "輸入小段", "輸入地號"]
 
 
 def app_dir() -> Path:
@@ -119,125 +118,157 @@ class PreparedInput:
     bad_landno: list[dict] = field(default_factory=list)
 
 
-def download_section_table(url: str) -> "pandas.DataFrame":
-    """下載地段代碼表，整理成 key/city/area/section 四欄。"""
-    import urllib3
-    import requests
-    import pandas as pd
-
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    resp = requests.get(url, verify=False, timeout=60)
-    resp.raise_for_status()
-    raw = pd.read_excel(io.BytesIO(resp.content))
-
-    A = raw.iloc[:, 0].fillna("").astype(str).str.strip()
-    B = raw.iloc[:, 1].fillna("").astype(str).str.strip()
-    C = raw.iloc[:, 2].fillna("").astype(str).str.strip()
-    E = raw.iloc[:, 4].fillna("").astype(str).str.strip()
-    F = raw.iloc[:, 5].fillna("").astype(str).str.strip()
-    G = raw.iloc[:, 6].fillna("").astype(str).str.strip()
-
-    out = pd.DataFrame()
-    out["key"] = F + G + A + B
-    out["city"] = E.str[0]
-    # area = 縣市碼 + 鄉鎮市區代碼（如 E20，給 Selenium 版的 land_area_office 下拉用）
-    out["area"] = E.str[0] + E.str[-2:]
-    # office = 「所區碼」前 2 碼（地政事務所代碼如 EF，給 API 版的 qryTileMapIndex 用）
-    out["office"] = E.str[:2]
-    out["section"] = (
-        pd.to_numeric(C, errors="coerce").fillna(0).astype(int).astype(str).str.zfill(4)
-    )
-    return out
-
-
-def _normalize_input(df: "pandas.DataFrame") -> "pandas.DataFrame":
-    df = df.copy()
-    df["大段"] = (
-        df["大段"].fillna("").astype(str).str.strip().str.replace(r"段$", "", regex=True)
-    )
-    df["小段"] = (
-        df["小段"].fillna("").astype(str).str.strip().str.replace(r"小段$", "", regex=True)
-    )
-    return df
-
-
 def _safe_str(v) -> str:
-    """把 pandas/numpy 的 NaN、None 轉成空字串；其餘 str() 後 strip。"""
-    import pandas as pd
+    """把 NaN、None 轉成空字串；其餘 str() 後 strip。"""
     if v is None:
         return ""
-    if isinstance(v, float) and pd.isna(v):
+    # float NaN：NaN 不等於自己
+    if isinstance(v, float) and v != v:
         return ""
     s = str(v).strip()
-    # pandas 把 NaN/NaT 轉成字串就是 "nan" / "NaT"，視為空
     if s in ("nan", "NaN", "NaT", "None"):
         return ""
     return s
 
 
+def _read_xlsx_rows(source) -> tuple[list[str], list[dict]]:
+    """讀 xlsx（第一個工作表），第一列當欄名。
+
+    source 可以是檔案路徑或 BytesIO。
+    回傳 (header, rows)；rows 是 list of dict，key 為欄名。
+    空白列（整列都 None）會被跳過。
+    """
+    from openpyxl import load_workbook
+    try:
+        wb = load_workbook(source, read_only=True, data_only=True)
+    except Exception as e:
+        raise ValueError(f"無法讀取 Excel（需 xlsx 格式）：{e}")
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        first = next(rows_iter)
+    except StopIteration:
+        wb.close()
+        return [], []
+    header = [(_safe_str(c) if c is not None else "") for c in first]
+    out: list[dict] = []
+    for row in rows_iter:
+        if not row or all(c is None for c in row):
+            continue
+        d = {}
+        for i, h in enumerate(header):
+            if not h:
+                continue
+            d[h] = row[i] if i < len(row) else None
+        out.append(d)
+    wb.close()
+    return header, out
+
+
+def download_section_table(url: str) -> dict[str, dict]:
+    """下載地段代碼表，整理成 key -> {city, area, office, section} 的索引。"""
+    import urllib3
+    import requests
+    from openpyxl import load_workbook
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    resp = requests.get(url, verify=False, timeout=60)
+    resp.raise_for_status()
+    try:
+        wb = load_workbook(io.BytesIO(resp.content), read_only=True, data_only=True)
+    except Exception as e:
+        raise ValueError(
+            f"LISP 下載回來的檔案不是 xlsx 格式，openpyxl 無法解析：{e}"
+        )
+    ws = wb.active
+
+    index: dict[str, dict] = {}
+    # 跳過第一列（標頭），用欄位位置取值，對應原本 raw.iloc[:, n]
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or all(c is None for c in row):
+            continue
+        def _col(i: int) -> str:
+            return _safe_str(row[i]) if i < len(row) else ""
+        A = _col(0)
+        B = _col(1)
+        C = _col(2)
+        E = _col(4)
+        F = _col(5)
+        G = _col(6)
+
+        key = F + G + A + B
+        city = E[:1]
+        # area = 縣市碼 + 鄉鎮市區代碼（如 E20）
+        area = (E[:1] + E[-2:]) if len(E) >= 2 else city
+        # office = 所區碼前 2 碼（如 EF）
+        office = E[:2]
+        try:
+            section_num = int(float(C)) if C else 0
+        except (ValueError, TypeError):
+            section_num = 0
+        section = str(section_num).zfill(4)
+
+        index[key] = {"city": city, "area": area, "office": office, "section": section}
+    wb.close()
+    return index
+
+
 def prepare_input(
-    input_df: "pandas.DataFrame",
-    section_df: "pandas.DataFrame",
+    input_rows: list[dict],
+    section_index: dict[str, dict],
     landno_pattern: str,
 ) -> PreparedInput:
-    """讀使用者輸入，套地段代碼，過濾找不到代碼 / 地號格式錯誤的資料。"""
-    missing = [c for c in INPUT_COLUMNS if c not in input_df.columns]
-    if missing:
-        raise ValueError(f"input.xlsx 缺少必要欄位: {', '.join(missing)}")
-
-    df = input_df.copy()
-    for src, dst in zip(INPUT_COLUMNS, INPUT_OUTPUT_COLUMNS):
-        df[dst] = df[src]
-
-    df = _normalize_input(df)
-    df["key"] = (
-        df["縣市"].astype(str).str.strip()
-        + df["行政區"].astype(str).str.strip()
-        + df["大段"].astype(str).str.strip()
-        + df["小段"].fillna("").astype(str).str.strip()
-    )
-
-    merged = df.merge(
-        section_df[["key", "city", "area", "office", "section"]], on="key", how="left"
-    )
+    """讀使用者輸入（list of dict），套地段代碼，過濾找不到代碼 / 地號格式錯誤的資料。"""
+    if input_rows:
+        missing = [c for c in INPUT_COLUMNS if c not in input_rows[0]]
+        if missing:
+            raise ValueError(f"input.xlsx 缺少必要欄位: {', '.join(missing)}")
 
     pattern = re.compile(landno_pattern)
     result = PreparedInput()
 
-    for _, row in merged.iterrows():
+    for row in input_rows:
+        city_in = _safe_str(row.get("縣市"))
+        area_in = _safe_str(row.get("行政區"))
+        seg_in = _safe_str(row.get("大段"))
+        sub_in = _safe_str(row.get("小段"))
         landno = _safe_str(row.get("地號"))
+
+        # 對 key 用的：大段去尾 "段"、小段去尾 "小段"
+        seg_norm = re.sub(r"段$", "", seg_in)
+        sub_norm = re.sub(r"小段$", "", sub_in)
+        key = city_in + area_in + seg_norm + sub_norm
+
         base_info = {
-            "輸入縣市": _safe_str(row["輸入縣市"]),
-            "輸入行政區": _safe_str(row["輸入行政區"]),
-            "輸入大段": _safe_str(row["輸入大段"]),
-            "輸入小段": _safe_str(row["輸入小段"]),
-            "輸入地號": _safe_str(row["輸入地號"]),
+            "輸入縣市": city_in,
+            "輸入行政區": area_in,
+            "輸入大段": seg_in,
+            "輸入小段": sub_in,
+            "輸入地號": landno,
             "landno": landno,
         }
 
-        # 找不到代碼
-        city = _safe_str(row.get("city"))
-        if not city:
+        sec = section_index.get(key)
+        if not sec or not sec.get("city"):
             result.no_code.append(base_info)
             continue
 
-        # 地號格式
         if not pattern.match(landno):
             result.bad_landno.append(base_info)
             continue
 
         result.valid.append(
             PreparedRow(
-                city=city,
-                area=_safe_str(row["area"]),
-                section=_safe_str(row["section"]).zfill(4),
+                city=sec["city"],
+                area=sec["area"],
+                section=sec["section"],  # 已經 zfill(4)
                 landno=landno,
-                輸入縣市=base_info["輸入縣市"],
-                輸入行政區=base_info["輸入行政區"],
-                輸入大段=base_info["輸入大段"],
-                輸入小段=base_info["輸入小段"],
-                輸入地號=base_info["輸入地號"],
-                office=_safe_str(row.get("office")),
+                輸入縣市=city_in,
+                輸入行政區=area_in,
+                輸入大段=seg_in,
+                輸入小段=sub_in,
+                輸入地號=landno,
+                office=sec.get("office", ""),
             )
         )
 
@@ -380,18 +411,19 @@ def export_results_template(
 
     來源欄不存在或值為 None/'' 時填空白；transform 套用後也可能是空白。
     """
-    import pandas as pd
+    from openpyxl import Workbook
     cols = list(columns) if columns is not None else list(EXPORT_COLUMNS_TEMPLATE)
 
-    rows_out = []
+    wb = Workbook()
+    ws = wb.active
+    ws.append([c["name"] for c in cols])
     for r in results:
-        new_row = {}
+        out_row = []
         for spec in cols:
-            name = spec["name"]
             src = spec.get("source")
             tx = spec.get("transform")
             if src is None:
-                new_row[name] = ""
+                out_row.append("")
                 continue
             val = r.get(src, "")
             if val is None:
@@ -403,11 +435,10 @@ def export_results_template(
                         val = fn(val)
                     except Exception:
                         pass
-            new_row[name] = val
-        rows_out.append(new_row)
-
-    df = pd.DataFrame(rows_out, columns=[c["name"] for c in cols]).fillna("")
-    df.to_excel(path, index=False)
+            out_row.append(val)
+        ws.append(out_row)
+    wb.save(path)
+    wb.close()
 
 
 def _parse_location_query(text: str) -> dict:
@@ -1272,9 +1303,14 @@ class App:
         if not path:
             return
         try:
-            import pandas as pd
-            df = pd.DataFrame(SAMPLE_INPUT_ROWS, columns=INPUT_COLUMNS)
-            df.to_excel(path, index=False)
+            from openpyxl import Workbook
+            wb = Workbook()
+            ws = wb.active
+            ws.append(INPUT_COLUMNS)
+            for r in SAMPLE_INPUT_ROWS:
+                ws.append(list(r))
+            wb.save(path)
+            wb.close()
             self._log(f"已產生範例 input.xlsx：{path}")
             ans = messagebox.askyesno(
                 "範例已產生",
@@ -1312,11 +1348,10 @@ class App:
 
         def worker():
             try:
-                import pandas as pd
-                section_df = download_section_table(self.cfg["section_url"])
-                input_df = pd.read_excel(path)
+                section_index = download_section_table(self.cfg["section_url"])
+                _, input_rows = _read_xlsx_rows(path)
                 prepared = prepare_input(
-                    input_df, section_df, self.cfg.get("landno_pattern", DEFAULT_CONFIG["landno_pattern"]))
+                    input_rows, section_index, self.cfg.get("landno_pattern", DEFAULT_CONFIG["landno_pattern"]))
                 self.root.after(0, lambda: self._on_prepared(prepared))
             except Exception as e:
                 msg = f"{e}\n\n{traceback.format_exc()}"

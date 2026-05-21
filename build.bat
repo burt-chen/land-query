@@ -9,6 +9,8 @@ py -m PyInstaller --noconfirm --clean ^
     --add-data "config.json;." ^
     --hidden-import openpyxl ^
     --hidden-import pyproj ^
+    --exclude-module pandas ^
+    --exclude-module numpy ^
     --exclude-module selenium ^
     --exclude-module bs4 ^
     --exclude-module PySide6 ^
