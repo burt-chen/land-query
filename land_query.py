@@ -166,7 +166,11 @@ def _read_xlsx_rows(source) -> tuple[list[str], list[dict]]:
 
 
 def download_section_table(url: str) -> dict[str, dict]:
-    """下載地段代碼表，整理成 key -> {city, area, office, section} 的索引。"""
+    """下載地段代碼表，整理成 key -> 段資料 的索引。
+
+    每筆段資料含：縣市 / 行政區 / 事務所 / 大段 / 小段 / 所區碼 / 備註（給人看）、
+    city / area / office / section（給查詢用的代碼）。
+    """
     import urllib3
     import requests
     from openpyxl import load_workbook
@@ -189,12 +193,14 @@ def download_section_table(url: str) -> dict[str, dict]:
             continue
         def _col(i: int) -> str:
             return _safe_str(row[i]) if i < len(row) else ""
-        A = _col(0)
-        B = _col(1)
-        C = _col(2)
-        E = _col(4)
-        F = _col(5)
-        G = _col(6)
+        A = _col(0)  # 段
+        B = _col(1)  # 小段
+        C = _col(2)  # 代碼
+        D = _col(3)  # 備註
+        E = _col(4)  # 所區碼
+        F = _col(5)  # 縣市名稱
+        G = _col(6)  # 鄉鎮名稱
+        H = _col(7)  # 事務所名稱
 
         key = F + G + A + B
         city = E[:1]
@@ -208,7 +214,11 @@ def download_section_table(url: str) -> dict[str, dict]:
             section_num = 0
         section = str(section_num).zfill(4)
 
-        index[key] = {"city": city, "area": area, "office": office, "section": section}
+        index[key] = {
+            "縣市": F, "行政區": G, "事務所": H, "大段": A, "小段": B,
+            "所區碼": E, "備註": D,
+            "city": city, "area": area, "office": office, "section": section,
+        }
     wb.close()
     return index
 
@@ -300,10 +310,9 @@ RALID_FIELD_MAP = {
     "AA08": "地目",
     "AA09": "等則",
     "AA10": "面積(平方公尺)",
-    "AA11": "公告土地現值起日",
-    "AA12": "公告土地現值",
-    "AA16": "申報地價",
-    "AA17": "公告土地現值(元/㎡)",
+    # AA11/AA12 在 ralid 是 base64 編碼，使用分區/使用地類別改從 land.AA11/AA12 直接取
+    "AA16": "公告現值",
+    "AA17": "公告地價",
     "AA21": "都市計畫面積",
     "AA22": "非都市計畫面積",
     "AA23": "使用分區",
@@ -417,8 +426,8 @@ EXPORT_COLUMNS_TEMPLATE = [
     {"name": "使用分區",          "source": "使用分區"},
     {"name": "使用地類別",        "source": "使用地類別"},
     {"name": "登記日期",          "source": "登記日期",       "transform": "minguo_date"},
-    {"name": "公告現值",          "source": "申報地價",                "transform": "yuan_per_sqm"},
-    {"name": "公告地價",          "source": "公告土地現值(元/㎡)",     "transform": "yuan_per_sqm"},
+    {"name": "公告現值",          "source": "公告現值",       "transform": "yuan_per_sqm"},
+    {"name": "公告地價",          "source": "公告地價",       "transform": "yuan_per_sqm"},
     {"name": "權利人類別",        "source": "權利人類別"},
     {"name": "地籍連結",          "source": "地籍連結(JSONP)"},
     {"name": "行政區",            "source": "行政區"},
@@ -529,6 +538,9 @@ def _api_format_land_record(
 
     ralid = payload.get("ralid") or {}
     for k, v in ralid.items():
+        # AA11/AA12 在 ralid 是 base64 編碼，跳過；改從 land.AA11/AA12 取純文字（見下方）
+        if k in ("AA11", "AA12"):
+            continue
         col = RALID_FIELD_MAP.get(k, k)
         data[col] = v
 
@@ -836,6 +848,11 @@ class App:
         self._output_path = tk.StringVar(value="")
 
         self._prepared: PreparedInput | None = None
+        self._section_index: dict[str, dict] = {}  # 地段代碼表（給「段名代碼表」分頁）
+        # 三個下拉的完整選項清單（打字過濾時的母清單）
+        self._sect_city_master: list[str] = []
+        self._sect_dist_master: list[str] = []
+        self._sect_seg_master: list[str] = []
         self._running = False
         self._stop_flag = False
         self._worker: threading.Thread | None = None
@@ -908,7 +925,179 @@ class App:
         inner.add(self.tree_nocode.frame, text="找不到代碼")
         inner.add(self.tree_bad.frame, text="地號格式錯誤")
 
+        # ---- 段名代碼表分頁（顯示整份地段代碼表，含連動下拉篩選）----
+        sect_tab = ttk.Frame(inner)
+        sect_tab.rowconfigure(1, weight=1)
+        sect_tab.columnconfigure(0, weight=1)
+
+        filter_bar = ttk.Frame(sect_tab)
+        filter_bar.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+
+        # 三個連動下拉（可打字過濾）
+        ttk.Label(filter_bar, text="縣市：").pack(side="left")
+        self._sect_city = ttk.Combobox(filter_bar, width=10)
+        self._sect_city.pack(side="left", padx=(0, 6))
+        self._sect_city.bind("<<ComboboxSelected>>", lambda e: self._on_sect_city_change())
+        self._sect_city.bind(
+            "<KeyRelease>",
+            lambda e: self._ac_keyrelease(self._sect_city, self._sect_city_master, e))
+
+        ttk.Label(filter_bar, text="行政區：").pack(side="left")
+        self._sect_dist = ttk.Combobox(filter_bar, width=10)
+        self._sect_dist.pack(side="left", padx=(0, 6))
+        self._sect_dist.bind("<<ComboboxSelected>>", lambda e: self._on_sect_dist_change())
+        self._sect_dist.bind(
+            "<KeyRelease>",
+            lambda e: self._ac_keyrelease(self._sect_dist, self._sect_dist_master, e))
+
+        ttk.Label(filter_bar, text="大段：").pack(side="left")
+        self._sect_seg = ttk.Combobox(filter_bar, width=14)
+        self._sect_seg.pack(side="left", padx=(0, 6))
+        self._sect_seg.bind("<<ComboboxSelected>>", lambda e: self._refresh_section_tree())
+        self._sect_seg.bind(
+            "<KeyRelease>",
+            lambda e: self._ac_keyrelease(self._sect_seg, self._sect_seg_master, e))
+
+        # 關鍵字篩選框（跨所有欄位的子字串比對）
+        ttk.Label(filter_bar, text="關鍵字：").pack(side="left")
+        self._sect_filter = tk.StringVar()
+        ent = ttk.Entry(filter_bar, textvariable=self._sect_filter, width=16)
+        ent.pack(side="left", padx=(0, 6))
+        ent.bind("<KeyRelease>", lambda e: self._refresh_section_tree())
+
+        ttk.Button(filter_bar, text="清除", command=self._clear_sect_filter).pack(side="left")
+        self._sect_count = tk.StringVar(value="尚未載入")
+        ttk.Label(filter_bar, textvariable=self._sect_count,
+                  foreground="#1976d2").pack(side="left", padx=12)
+
+        self.tree_section = self._make_tree(
+            sect_tab, ("#", "縣市", "行政區", "事務所", "大段", "小段",
+                       "代碼", "所區碼", "city", "area", "office", "備註"))
+        self.tree_section.frame.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
+        inner.add(sect_tab, text="段名代碼表")
+
         return page
+
+    # 篩選結果最多顯示幾筆（避免 1.7 萬筆全塞進 Treeview 卡頓）
+    _SECTION_TREE_LIMIT = 1000
+    # 下拉選單「不篩選」的選項文字
+    _SECT_ALL = "（全部）"
+
+    # 打字時要忽略的非輸入按鍵
+    _AC_SKIP_KEYS = frozenset((
+        "Up", "Down", "Left", "Right", "Return", "Escape", "Tab", "Prior", "Next",
+        "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R",
+    ))
+
+    def _ac_keyrelease(self, combo, master: list[str], event) -> None:
+        """combobox 打字時即時過濾下拉清單，並重整表格。"""
+        if event.keysym in self._AC_SKIP_KEYS:
+            return
+        typed = combo.get().strip().lower()
+        if typed:
+            combo["values"] = [v for v in master if typed in v.lower()] or master
+        else:
+            combo["values"] = master
+        self._refresh_section_tree()
+
+    def _populate_sect_filters(self) -> None:
+        """段碼表載入後：縣市下拉填好、行政區/大段清空。"""
+        rows = list(self._section_index.values())
+        cities = sorted({r["縣市"] for r in rows if r["縣市"]})
+        self._sect_city_master = [self._SECT_ALL] + cities
+        self._sect_dist_master = [self._SECT_ALL]
+        self._sect_seg_master = [self._SECT_ALL]
+        self._sect_city["values"] = self._sect_city_master
+        self._sect_city.set(self._SECT_ALL)
+        self._sect_dist["values"] = self._sect_dist_master
+        self._sect_dist.set(self._SECT_ALL)
+        self._sect_seg["values"] = self._sect_seg_master
+        self._sect_seg.set(self._SECT_ALL)
+
+    def _on_sect_city_change(self) -> None:
+        """選了縣市 → 重填行政區下拉、清空大段。"""
+        city = self._sect_city.get()
+        rows = list(self._section_index.values())
+        if city and city != self._SECT_ALL:
+            dists = sorted({r["行政區"] for r in rows if r["縣市"] == city and r["行政區"]})
+        else:
+            dists = []
+        self._sect_dist_master = [self._SECT_ALL] + dists
+        self._sect_seg_master = [self._SECT_ALL]
+        self._sect_dist["values"] = self._sect_dist_master
+        self._sect_dist.set(self._SECT_ALL)
+        self._sect_seg["values"] = self._sect_seg_master
+        self._sect_seg.set(self._SECT_ALL)
+        self._refresh_section_tree()
+
+    def _on_sect_dist_change(self) -> None:
+        """選了行政區 → 重填大段下拉。"""
+        city = self._sect_city.get()
+        dist = self._sect_dist.get()
+        rows = list(self._section_index.values())
+        if (city and city != self._SECT_ALL) and (dist and dist != self._SECT_ALL):
+            segs = sorted({
+                r["大段"] for r in rows
+                if r["縣市"] == city and r["行政區"] == dist and r["大段"]
+            })
+        else:
+            segs = []
+        self._sect_seg_master = [self._SECT_ALL] + segs
+        self._sect_seg["values"] = self._sect_seg_master
+        self._sect_seg.set(self._SECT_ALL)
+        self._refresh_section_tree()
+
+    def _clear_sect_filter(self) -> None:
+        """清除三個下拉 + 關鍵字框，回到全部。"""
+        self._sect_filter.set("")
+        self._populate_sect_filters()
+        self._refresh_section_tree()
+
+    def _refresh_section_tree(self) -> None:
+        """依縣市/行政區/大段下拉 + 關鍵字框重建「段名代碼表」的 Treeview。"""
+        tree = self.tree_section
+        tree.delete(*tree.get_children())
+
+        rows = list(self._section_index.values())
+        if not rows:
+            self._sect_count.set("尚未載入（先到上方挑輸入檔）")
+            return
+
+        # 下拉用子字串比對（這樣打字打一半也能過濾）
+        city = self._sect_city.get().strip()
+        dist = self._sect_dist.get().strip()
+        seg = self._sect_seg.get().strip()
+        kw = self._sect_filter.get().strip().lower()
+        if city and city != self._SECT_ALL:
+            rows = [r for r in rows if city in r["縣市"]]
+        if dist and dist != self._SECT_ALL:
+            rows = [r for r in rows if dist in r["行政區"]]
+        if seg and seg != self._SECT_ALL:
+            rows = [r for r in rows if seg in r["大段"]]
+        if kw:
+            rows = [
+                r for r in rows
+                if kw in (
+                    f"{r['縣市']}{r['行政區']}{r['事務所']}{r['大段']}{r['小段']}"
+                    f"{r['所區碼']}{r['備註']}"
+                    f"{r['city']}{r['area']}{r['office']}{r['section']}"
+                ).lower()
+            ]
+
+        shown = rows[: self._SECTION_TREE_LIMIT]
+        for i, r in enumerate(shown, start=1):
+            tree.insert("", "end", values=(
+                i, r["縣市"], r["行政區"], r["事務所"], r["大段"], r["小段"],
+                r["section"], r["所區碼"], r["city"], r["area"], r["office"],
+                r["備註"],
+            ))
+
+        total = len(rows)
+        if total > self._SECTION_TREE_LIMIT:
+            self._sect_count.set(
+                f"符合 {total} 筆，顯示前 {self._SECTION_TREE_LIMIT} 筆（請縮小篩選範圍）")
+        else:
+            self._sect_count.set(f"符合 {total} 筆")
 
     @staticmethod
     def _make_tree(parent, columns):
@@ -1369,15 +1558,18 @@ class App:
                 _, input_rows = _read_xlsx_rows(path)
                 prepared = prepare_input(
                     input_rows, section_index, self.cfg.get("landno_pattern", DEFAULT_CONFIG["landno_pattern"]))
-                self.root.after(0, lambda: self._on_prepared(prepared))
+                self.root.after(0, lambda: self._on_prepared(prepared, section_index))
             except Exception as e:
                 msg = f"{e}\n\n{traceback.format_exc()}"
                 self.root.after(0, lambda: self._on_prepare_failed(msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_prepared(self, prepared: PreparedInput) -> None:
+    def _on_prepared(self, prepared: PreparedInput, section_index: dict[str, dict]) -> None:
         self._prepared = prepared
+        self._section_index = section_index
+        self._populate_sect_filters()
+        self._refresh_section_tree()
         for t in (self.tree_valid, self.tree_nocode, self.tree_bad):
             t.delete(*t.get_children())
         for i, r in enumerate(prepared.valid, start=1):
