@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
 
@@ -89,6 +89,146 @@ def save_config(cfg: dict) -> None:
     config_path().write_text(
         json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+
+def export_cols_path() -> Path:
+    return app_dir() / "export_cols.json"
+
+
+def _load_export_state() -> dict:
+    """讀整份 export_cols.json，回 {active, active_preset_name, presets}。
+
+    向後相容：舊版檔案是純 list，視為 active。
+    """
+    empty = {"active": None, "active_preset_name": "", "presets": {}}
+    path = export_cols_path()
+    if not path.exists():
+        return dict(empty)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, list):  # 舊格式
+            return {"active": data, "active_preset_name": "", "presets": {}}
+        if not isinstance(data, dict):
+            return dict(empty)
+        active = data.get("active")
+        presets = data.get("presets")
+        name = data.get("active_preset_name")
+        return {
+            "active": active if isinstance(active, list) else None,
+            "active_preset_name": name if isinstance(name, str) else "",
+            "presets": presets if isinstance(presets, dict) else {},
+        }
+    except Exception:
+        return dict(empty)
+
+
+def _save_export_state(state: dict) -> bool:
+    try:
+        export_cols_path().write_text(
+            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _cols_to_serializable(cols: list[dict]) -> list[dict]:
+    return [
+        {
+            "name": c["name"],
+            "source": c.get("source"),
+            "transform": c.get("transform"),
+            "enabled": bool(c.get("enabled", True)),
+        }
+        for c in cols
+    ]
+
+
+def _normalize_export_cols(saved: list[dict]) -> list[dict]:
+    """套模板對應：保留使用者順序/名稱/enabled，補新欄位、丟過時欄位。
+
+    識別 key = (source, transform)，所以重命名不會影響對應。
+    """
+    def sig(c: dict) -> tuple:
+        return (c.get("source"), c.get("transform"))
+
+    template_by_sig = {sig(c): c for c in EXPORT_COLUMNS_TEMPLATE}
+    seen: set[tuple] = set()
+    result: list[dict] = []
+    for c in saved:
+        if not isinstance(c, dict):
+            continue
+        s = sig(c)
+        tpl = template_by_sig.get(s)
+        if tpl is None:  # 模板沒有 → 過時欄位
+            continue
+        result.append({
+            "name": c.get("name") or tpl["name"],
+            "source": tpl.get("source"),
+            "transform": tpl.get("transform"),
+            "enabled": bool(c.get("enabled", True)),
+        })
+        seen.add(s)
+    # 模板有、檔案沒有的：附加到末尾，預設顯示
+    for tpl in EXPORT_COLUMNS_TEMPLATE:
+        if sig(tpl) not in seen:
+            result.append({
+                "name": tpl["name"],
+                "source": tpl.get("source"),
+                "transform": tpl.get("transform"),
+                "enabled": True,
+            })
+    return result
+
+
+def load_export_cols() -> list[dict]:
+    """讀 active 欄位設定；缺檔或損毀就回預設。"""
+    state = _load_export_state()
+    saved = state.get("active")
+    if not isinstance(saved, list):
+        return [dict(c, enabled=True) for c in EXPORT_COLUMNS_TEMPLATE]
+    return _normalize_export_cols(saved)
+
+
+def save_export_cols(cols: list[dict], preset_name: str = "") -> bool:
+    """寫入 active 欄位設定（保留現有 presets）+ 紀錄目前是哪個 preset 套上來的。"""
+    state = _load_export_state()
+    state["active"] = _cols_to_serializable(cols)
+    state["active_preset_name"] = preset_name or ""
+    return _save_export_state(state)
+
+
+def load_active_preset_name() -> str:
+    return _load_export_state().get("active_preset_name", "")
+
+
+def list_export_presets() -> list[str]:
+    return sorted(_load_export_state().get("presets", {}).keys())
+
+
+def load_export_preset(name: str) -> list[dict] | None:
+    presets = _load_export_state().get("presets", {})
+    saved = presets.get(name)
+    if not isinstance(saved, list):
+        return None
+    return _normalize_export_cols(saved)
+
+
+def save_export_preset(name: str, cols: list[dict]) -> bool:
+    if not name or not name.strip():
+        return False
+    state = _load_export_state()
+    state.setdefault("presets", {})
+    state["presets"][name] = _cols_to_serializable(cols)
+    return _save_export_state(state)
+
+
+def delete_export_preset(name: str) -> bool:
+    state = _load_export_state()
+    presets = state.get("presets", {})
+    if name not in presets:
+        return False
+    del presets[name]
+    return _save_export_state(state)
 
 
 # ===========================================================================
@@ -416,6 +556,42 @@ _TRANSFORMS = {
 }
 
 
+# (source, transform) → (來源描述, 處理描述) for「欄位設定」對話框
+# 跟 api_field_mapping.md 的 30 欄總表保持一致；新增/改 EXPORT_COLUMNS_TEMPLATE 時記得同步
+COLUMN_DESCRIPTIONS: dict[tuple, tuple[str, str]] = {
+    ("輸入縣市", None):                ("使用者 input.xlsx", ""),
+    ("輸入行政區", None):              ("使用者 input.xlsx", ""),
+    ("輸入大段", None):                ("使用者 input.xlsx", ""),
+    ("輸入小段", None):                ("使用者 input.xlsx", ""),
+    ("輸入地號", None):                ("使用者 input.xlsx", ""),
+    ("面積(平方公尺)", None):          ("ralid.AA10", ""),
+    ("使用分區", None):                ("land.AA11", ""),
+    ("使用地類別", None):              ("land.AA12", ""),
+    ("登記日期", "minguo_date"):       ("ralid.AA05", "轉民國年月日"),
+    ("公告現值", "yuan_per_sqm"):      ("ralid.AA16", "加單位「元/平方公尺」"),
+    ("公告地價", "yuan_per_sqm"):      ("ralid.AA17", "加單位「元/平方公尺」"),
+    ("權利人類別", None):              ("lcdetype.lcde_*", "組字串「本國人:63.77%外國人:4.76%國有:31.47%」"),
+    ("地籍連結(JSONP)", None):         ("qryTileMapIndex cx,cy", "組 http://maps.nlsc.gov.tw/go/{cy}/{cx}"),
+    ("行政區", None):                  ("LocationQuery 解析", ""),
+    ("經緯度(JSONP)", None):           ("qryTileMapIndex cx,cy", "直接組 cx,cy"),
+    ("經緯度(度分秒)", None):          ("LocationQuery 解析", ""),
+    ("TWD97", None):                   ("從 cx,cy 純 Python 換算", "格式 E:xxx N:xxx,EPSG:3826"),
+    ("地號(JSONP組合)", None):         ("組合字串", "{所}所({office}{sect}){段}{地號}地號"),
+    ("所有人_姓名", None):             ("land.userList[0].name", ""),
+    ("所有人_身分證號", None):         ("land.userList[0].id", ""),
+    ("所有人_類型", None):             ("land.userList[0].type", ""),
+    ("所有人_範圍", None):             ("land.userList[0].scope", ""),
+    ("所有人_持分", "frac_den"):       ("land.userList[0].denominator", "從 1/3 取分母"),
+    ("所有人_持分", "frac_num"):       ("land.userList[0].numerator", "從 1/3 取分子"),
+    ("所有人_公告現值", "yuan_per_sqm"): ("land.userList[0].price", "加單位「元/平方公尺」"),
+    ("所有人_管理機關", None):         ("land.userList[0].manage", ""),
+    ("查詢縣市", None):                ("LISP 段碼表對碼", ""),
+    ("查詢區", None):                  ("LISP 段碼表對碼", ""),
+    ("查詢地段", None):                ("LISP 段碼表對碼", ""),
+    ("查詢地號", None):                ("LISP 段碼表對碼", ""),
+}
+
+
 EXPORT_COLUMNS_TEMPLATE = [
     {"name": "輸入縣市",          "source": "輸入縣市"},
     {"name": "輸入行政區",        "source": "輸入行政區"},
@@ -433,6 +609,7 @@ EXPORT_COLUMNS_TEMPLATE = [
     {"name": "行政區",            "source": "行政區"},
     {"name": "經緯度(度)",        "source": "經緯度(JSONP)"},
     {"name": "經緯度(度分秒)",    "source": "經緯度(度分秒)"},
+    {"name": "TWD97",             "source": "TWD97"},  # 純 Python 從 cx,cy 換算（E:xxx N:xxx）
     {"name": "地號",              "source": "地號(JSONP組合)"},
     {"name": "所有權人",          "source": "所有人_姓名"},
     {"name": "統一編號",          "source": "所有人_身分證號"},
@@ -486,6 +663,56 @@ def export_results_template(
         ws.append(out_row)
     wb.save(path)
     wb.close()
+
+
+def _wgs84_to_twd97(lon: float, lat: float) -> tuple[float, float] | None:
+    """WGS84 (EPSG:4326) → TWD97 二度分帶 (EPSG:3826)。
+
+    純 Python 實作（不依賴 pyproj），用 GRS80 橢球 + 121°E 中央子午線。
+    精度約 ±1 公尺，對顯示用途夠用；想要 mm 級精度才換 pyproj。
+    """
+    from math import radians, sin, cos, tan, sqrt
+    try:
+        # GRS80 ellipsoid
+        a = 6378137.0
+        f = 1.0 / 298.257222101
+        e2 = 2 * f - f * f
+        # TWD97 二度分帶 EPSG:3826 參數
+        k0 = 0.9999
+        lon0 = radians(121.0)   # 中央子午線
+        x0 = 250000.0           # false easting
+        y0 = 0.0                # false northing
+
+        phi = radians(lat)
+        lam = radians(lon)
+
+        ep2 = e2 / (1 - e2)
+        N = a / sqrt(1 - e2 * sin(phi) ** 2)
+        T = tan(phi) ** 2
+        C = ep2 * cos(phi) ** 2
+        A = (lam - lon0) * cos(phi)
+
+        M = a * (
+            (1 - e2 / 4 - 3 * e2 ** 2 / 64 - 5 * e2 ** 3 / 256) * phi
+            - (3 * e2 / 8 + 3 * e2 ** 2 / 32 + 45 * e2 ** 3 / 1024) * sin(2 * phi)
+            + (15 * e2 ** 2 / 256 + 45 * e2 ** 3 / 1024) * sin(4 * phi)
+            - (35 * e2 ** 3 / 3072) * sin(6 * phi)
+        )
+
+        x = k0 * N * (
+            A + (1 - T + C) * A ** 3 / 6
+            + (5 - 18 * T + T ** 2 + 72 * C - 58 * ep2) * A ** 5 / 120
+        ) + x0
+        y = k0 * (
+            M + N * tan(phi) * (
+                A ** 2 / 2
+                + (5 - T + 9 * C + 4 * C ** 2) * A ** 4 / 24
+                + (61 - 58 * T + T ** 2 + 600 * C - 330 * ep2) * A ** 6 / 720
+            )
+        ) + y0
+        return x, y
+    except Exception:
+        return None
 
 
 def _parse_location_query(text: str) -> dict:
@@ -599,6 +826,11 @@ def _api_format_land_record(
     if tile_index and "cx" in tile_index and "cy" in tile_index:
         if not data.get("經緯度(度)"):
             data["經緯度(度)"] = f"{tile_index['cx']},{tile_index['cy']}"
+        # TWD97 從 cx,cy 換算（純 Python，不需 pyproj）
+        twd97 = _wgs84_to_twd97(tile_index["cx"], tile_index["cy"])
+        if twd97:
+            e, n = twd97
+            data["TWD97"] = f"E:{int(round(e))} N:{int(round(n))}"
 
     # 從 tile_index 組出 3 個衍生字串欄位（給 EXPORT_COLUMNS_TEMPLATE 用）
     if tile_index:
@@ -785,6 +1017,12 @@ def run_api_query(
         # --- 攤平 ---
         data = _api_format_land_record(row, payload, location_text, tile_index)
 
+        # 保留 3 顆 API 的原始回應，給 GUI 右鍵「檢視 API 回應」用
+        # 用底線開頭，export_results_template 不會誤抓到（它只看 EXPORT_COLUMNS_TEMPLATE）
+        data["_raw_payload"] = payload
+        data["_raw_tile"] = tile_index
+        data["_raw_location"] = location_text
+
         if not (payload.get("ralid") or payload.get("land", {}).get("userList")):
             data["查詢狀態"] = "查無資料"
         else:
@@ -862,6 +1100,8 @@ class App:
         self._worker_api: threading.Thread | None = None
         self._results_api_done: list[dict] = []
         self._results_api_fail: list[dict] = []
+        # 可調整的匯出欄位設定（顯示/順序/欄位名），優先讀 export_cols.json
+        self._export_cols: list[dict] = load_export_cols()
 
         self._build_ui()
 
@@ -1121,10 +1361,19 @@ class App:
 
     # ===== API 執行分頁（唯一的執行分頁） ================================
 
-    # done tree 欄位 = 「#」+ EXPORT_COLUMNS_TEMPLATE 31 欄（跟匯出格式完全一致）
+    @staticmethod
+    def _default_export_cols() -> list[dict]:
+        """從 EXPORT_COLUMNS_TEMPLATE 複製出可變的設定（含 enabled=True）。"""
+        return [dict(c, enabled=True) for c in EXPORT_COLUMNS_TEMPLATE]
+
+    def _enabled_export_cols(self) -> list[dict]:
+        """目前被勾選顯示的欄位（給 done tree / Excel 匯出共用）。"""
+        return [c for c in self._export_cols if c.get("enabled", True)]
+
+    # done tree 欄位 = 「#」+ 目前勾選顯示的匯出欄
     @property
     def _DONE_COLS(self) -> list[str]:
-        return ["#"] + [s["name"] for s in EXPORT_COLUMNS_TEMPLATE]
+        return ["#"] + [c["name"] for c in self._enabled_export_cols()]
 
     # fail tree 欄位 = 「#」+「查詢狀態」+ 輸入 5 欄（簡潔，看失敗原因用）
     _FAIL_COLS = [
@@ -1138,7 +1387,7 @@ class App:
         "面積": 80, "使用分區": 80, "使用地類別": 100,
         "登記日期": 150, "公告現值": 130, "公告地價": 130, "權利人類別": 100,
         "地籍連結": 320, "行政區": 200,
-        "經緯度(度)": 180, "經緯度(度分秒)": 200,
+        "經緯度(度)": 180, "經緯度(度分秒)": 200, "TWD97": 160,
         "地號": 280,
         "所有權人": 130, "統一編號": 120, "所有權人類別": 100, "權利範圍類別": 100,
         "權利範圍持分_分母": 120, "權利範圍持分_分子": 120,
@@ -1174,9 +1423,11 @@ class App:
         self.btn_clear_api.pack(side="left")
         self._run_status_api = tk.StringVar(value="待命")
         ttk.Label(bar, textvariable=self._run_status_api).pack(side="left", padx=12)
-        # 匯出按鈕推到最右
+        # 匯出按鈕 + 欄位設定推到最右
         self.btn_export_api = ttk.Button(bar, text="匯出 Excel", command=self._do_export_api, state="disabled")
         self.btn_export_api.pack(side="right")
+        ttk.Button(bar, text="欄位設定…",
+                   command=self._open_export_cols_dialog).pack(side="right", padx=(0, 8))
 
         ttk.Label(page, text="進度：").grid(row=2, column=0, sticky="w", padx=4)
         self.progress_api = ttk.Progressbar(page, mode="determinate", maximum=100)
@@ -1209,7 +1460,80 @@ class App:
         hbar.grid(row=1, column=0, sticky="ew")
         if kind == "fail":
             tree.tag_configure("row", background="#fdecea")
+        # 右鍵 → 彈視窗顯示這筆的 3 顆 API 原始回應
+        tree.bind("<Button-3>", lambda e, k=kind: self._on_result_right_click(e, k))
         return frame, tree
+
+    def _on_result_right_click(self, event, kind: str) -> None:
+        """右鍵按到某列：彈視窗顯示該筆的原始 API 回應。"""
+        tree = event.widget
+        row_iid = tree.identify_row(event.y)
+        if not row_iid:
+            return
+        try:
+            idx = int(row_iid)
+        except ValueError:
+            return
+        results = (self._results_api_done if kind == "done"
+                   else self._results_api_fail)
+        if 0 < idx <= len(results):
+            self._show_raw_api_response(results[idx - 1])
+
+    def _show_raw_api_response(self, data: dict) -> None:
+        """彈出視窗顯示這筆資料的 3 顆 API 原始回應。"""
+        top = tk.Toplevel(self.root)
+        top.title("API 原始回應")
+        top.geometry("900x700")
+
+        head = (
+            f"{data.get('輸入縣市','')} {data.get('輸入行政區','')} "
+            f"{data.get('輸入大段','')}{data.get('輸入小段','')} "
+            f"{data.get('輸入地號','')}    [{data.get('查詢狀態','')}]"
+        )
+        tk.Label(top, text=head, anchor="w", justify="left",
+                 background="#e3f2fd", padx=10, pady=6,
+                 ).pack(fill="x", padx=8, pady=(8, 4))
+
+        txt = ScrolledText(top, wrap="word", font=("Consolas", 10))
+        txt.pack(fill="both", expand=True, padx=8, pady=4)
+
+        def section(title: str) -> None:
+            txt.insert("end", "=" * 70 + "\n")
+            txt.insert("end", f"{title}\n")
+            txt.insert("end", "=" * 70 + "\n")
+
+        section("1. getLandInfoSect（土地基本資訊 + 所有人 + 公有土地）")
+        payload = data.get("_raw_payload")
+        if payload is None:
+            txt.insert("end", "(無資料 — 此筆 API 失敗或尚未呼叫，看「查詢狀態」)\n")
+        else:
+            txt.insert("end", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        txt.insert("end", "\n")
+
+        section("2. qryTileMapIndex（地塊中心 + 地段中文名）")
+        tile = data.get("_raw_tile")
+        if tile is None:
+            txt.insert("end", "(無資料)\n")
+        else:
+            txt.insert("end", json.dumps(tile, ensure_ascii=False, indent=2) + "\n")
+        txt.insert("end", "\n")
+
+        section("3. LocationQuery（行政區 + 經緯度 + 國土利用）")
+        loc = data.get("_raw_location")
+        if loc is None or loc == "":
+            txt.insert("end", "(無資料)\n")
+        else:
+            txt.insert("end", loc + "\n")
+
+        txt.configure(state="disabled")
+
+        bottom = ttk.Frame(top)
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bottom, text="關閉", command=top.destroy).pack(side="right")
+        ttk.Button(
+            bottom, text="複製全部",
+            command=lambda: (top.clipboard_clear(), top.clipboard_append(txt.get("1.0", "end-1c"))),
+        ).pack(side="right", padx=(0, 8))
 
     def _apply_api_column_widths(self, tree: ttk.Treeview) -> None:
         """套用欄寬。"""
@@ -1219,16 +1543,328 @@ class App:
             anchor = "e" if c == "#" else "w"
             tree.column(c, width=w, anchor=anchor, stretch=False)
 
+    # ===== 匯出欄位設定 =====================================================
+
+    @staticmethod
+    def _excel_col_letter(n: int) -> str:
+        """1→A, 26→Z, 27→AA, 30→AD"""
+        s = ""
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    def _apply_export_cols_change(self) -> None:
+        """欄位設定變更後：done tree 重建欄位 + 重新填值。"""
+        cols = self._DONE_COLS
+        tree = self.result_tree_api_done
+        tree["columns"] = cols
+        # heading + 寬度重套
+        self._apply_api_column_widths(tree)
+        # 重新塞所有目前完成的結果
+        tree.delete(*tree.get_children())
+        for i, r in enumerate(self._results_api_done, start=1):
+            self._insert_done_row(tree, r, i)
+
+    def _open_export_cols_dialog(self) -> None:
+        """彈出「匯出欄位設定」對話框。"""
+        top = tk.Toplevel(self.root)
+        top.title("匯出欄位設定")
+        top.geometry("1020x720")
+        top.transient(self.root)
+
+        def _sort_unchecked_to_bottom(cols: list[dict]) -> list[dict]:
+            """穩定排序：未勾選的搬到最下方，同組內保留原順序。"""
+            return sorted(cols, key=lambda c: 0 if c.get("enabled", True) else 1)
+
+        # 暫存工作副本，按「套用」才寫回 self._export_cols
+        # 開啟時穩定排序：未勾選的移到最下方（保留同組內原本順序）
+        working: list[dict] = _sort_unchecked_to_bottom([dict(c) for c in self._export_cols])
+
+        # ====== 設定檔列：下拉 / 另存 / 刪除 ===================================
+        preset_bar = ttk.Frame(top)
+        preset_bar.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(preset_bar, text="設定檔：").pack(side="left")
+        preset_var = tk.StringVar(value="")
+        preset_cb = ttk.Combobox(
+            preset_bar, textvariable=preset_var, width=22, state="readonly")
+        preset_cb.pack(side="left", padx=(0, 6))
+
+        DEFAULT_LABEL = "（預設）"
+
+        def reload_preset_list(select: str | None = None) -> None:
+            names = list_export_presets()
+            preset_cb["values"] = [DEFAULT_LABEL] + names
+            if select and select in names:
+                preset_var.set(select)
+            elif preset_var.get() not in preset_cb["values"]:
+                preset_var.set(DEFAULT_LABEL)
+
+        # 啟動時：把下拉值設成上次套用的 preset 名（若有）
+        initial_name = load_active_preset_name()
+        reload_preset_list(select=initial_name if initial_name else None)
+        if not initial_name or initial_name not in list_export_presets():
+            preset_var.set(DEFAULT_LABEL)
+
+        def on_preset_pick(_e=None):
+            name = preset_var.get()
+            if name == DEFAULT_LABEL:
+                # 選「預設」= 載入原始預設值
+                working.clear()
+                working.extend(_sort_unchecked_to_bottom(self._default_export_cols()))
+                refresh()
+                return
+            if not name:
+                return
+            cols = load_export_preset(name)
+            if cols is None:
+                messagebox.showwarning("讀取失敗", f"設定檔「{name}」讀不到。")
+                return
+            working.clear()
+            working.extend(_sort_unchecked_to_bottom(cols))
+            refresh()
+
+        preset_cb.bind("<<ComboboxSelected>>", on_preset_pick)
+
+        def do_save_as():
+            name = simpledialog.askstring(
+                "另存設定檔", "請輸入設定檔名稱：", parent=top)
+            if name is None:
+                return
+            name = name.strip()
+            if not name:
+                messagebox.showwarning("名稱不可空白", "請輸入名稱。", parent=top)
+                return
+            if name in list_export_presets():
+                if not messagebox.askyesno(
+                        "確認覆蓋", f"設定檔「{name}」已存在，要覆蓋嗎？", parent=top):
+                    return
+            if save_export_preset(name, working):
+                reload_preset_list(select=name)
+                messagebox.showinfo("已存", f"設定檔「{name}」已儲存。", parent=top)
+            else:
+                messagebox.showerror("儲存失敗", "寫入 export_cols.json 失敗。", parent=top)
+
+        def do_delete_preset():
+            name = preset_var.get()
+            if not name or name == DEFAULT_LABEL:
+                messagebox.showinfo("沒選", "請先在下拉選一個要刪除的設定檔。", parent=top)
+                return
+            if not messagebox.askyesno("確認刪除", f"刪除設定檔「{name}」？", parent=top):
+                return
+            if delete_export_preset(name):
+                reload_preset_list()
+            else:
+                messagebox.showerror("刪除失敗", "寫入 export_cols.json 失敗。", parent=top)
+
+        ttk.Button(preset_bar, text="另存…", command=do_save_as).pack(side="left", padx=(0, 4))
+        ttk.Button(preset_bar, text="刪除", command=do_delete_preset).pack(side="left")
+
+        # ====== 操作說明 ======================================================
+        tk.Label(
+            top, anchor="w", justify="left", padx=10, pady=8,
+            background="#f5f8ff", relief="solid", borderwidth=1,
+            text=("• 從上方「設定檔」下拉可載入已存好的組合（套用前在此預覽）\n"
+                  "• 點「顯示」欄的 ☑/☐ 切換是否匯出；雙擊「欄位名」可改名\n"
+                  "• 拖曳列可調整順序;「Excel 欄」會即時更新"),
+        ).pack(fill="x", padx=8, pady=(0, 4))
+
+        # ====== Treeview ======================================================
+        mid = ttk.Frame(top)
+        mid.pack(fill="both", expand=True, padx=8, pady=4)
+        mid.rowconfigure(0, weight=1)
+        mid.columnconfigure(0, weight=1)
+
+        tree = ttk.Treeview(
+            mid, columns=("顯示", "Excel欄", "欄位名", "資料來源", "處理"),
+            show="headings", selectmode="browse",
+        )
+        widths = {"顯示": 50, "Excel欄": 60, "欄位名": 170, "資料來源": 230, "處理": 380}
+        for c in tree["columns"]:
+            tree.heading(c, text=c)
+            tree.column(c, width=widths[c], anchor="w", stretch=(c == "欄位名"))
+        tree.column("顯示", anchor="center")
+        tree.column("Excel欄", anchor="center")
+        tree.tag_configure("drag_hover", background="#ffe0b2")  # 拖曳目標高亮
+
+        vbar = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=vbar.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vbar.grid(row=0, column=1, sticky="ns")
+
+        def refresh(select_iid: str | None = None) -> None:
+            tree.delete(*tree.get_children())
+            shown_pos = 0
+            for i, c in enumerate(working):
+                enabled = c.get("enabled", True)
+                if enabled:
+                    shown_pos += 1
+                    letter = self._excel_col_letter(shown_pos)
+                else:
+                    letter = ""  # 未勾選 → 空白（不顯示「—」）
+                desc_src, desc_tx = COLUMN_DESCRIPTIONS.get(
+                    (c.get("source"), c.get("transform")),
+                    (c.get("source") or "", c.get("transform") or ""),  # 沒對應就退回原始值
+                )
+                tree.insert(
+                    "", "end", iid=str(i),
+                    values=(
+                        "☑" if enabled else "☐",
+                        letter,
+                        c["name"],
+                        desc_src,
+                        desc_tx,
+                    ),
+                )
+            if select_iid is not None and select_iid in tree.get_children():
+                tree.selection_set(select_iid)
+                tree.see(select_iid)
+
+        refresh()
+
+        # ---- 拖曳排序 + 點 ☑/☐ 切換 ----
+        drag = {"src": None}  # type: dict[str, str | None]
+
+        def _clear_hover():
+            for iid in tree.get_children():
+                tags = list(tree.item(iid, "tags"))
+                if "drag_hover" in tags:
+                    tags.remove("drag_hover")
+                    tree.item(iid, tags=tags)
+
+        def on_press(event):
+            if tree.identify_region(event.x, event.y) != "cell":
+                return
+            col = tree.identify_column(event.x)
+            row = tree.identify_row(event.y)
+            if not row:
+                return
+            idx = int(row)
+            if col == "#1":  # 顯示欄 → 切換 enabled，不啟動拖曳
+                working[idx]["enabled"] = not working[idx].get("enabled", True)
+                refresh(select_iid=row)
+                return
+            # 其他欄：標記拖曳來源
+            drag["src"] = row
+            tree.selection_set(row)
+
+        def on_motion(event):
+            if drag["src"] is None:
+                return
+            target = tree.identify_row(event.y)
+            _clear_hover()
+            if target and target != drag["src"]:
+                tags = list(tree.item(target, "tags"))
+                tags.append("drag_hover")
+                tree.item(target, tags=tags)
+
+        def on_release(event):
+            src_iid = drag["src"]
+            drag["src"] = None
+            _clear_hover()
+            if src_iid is None:
+                return
+            target_iid = tree.identify_row(event.y)
+            if not target_iid or target_iid == src_iid:
+                return
+            src_idx = int(src_iid)
+            target_idx = int(target_iid)
+            item = working.pop(src_idx)
+            # pop 後，若 src < target 則 target 在 list 中往前移 1
+            if src_idx < target_idx:
+                target_idx -= 1
+            working.insert(target_idx, item)
+            refresh(select_iid=str(target_idx))
+
+        tree.bind("<ButtonPress-1>", on_press)
+        tree.bind("<B1-Motion>", on_motion)
+        tree.bind("<ButtonRelease-1>", on_release)
+
+        # ---- 雙擊「欄位名」改名（Entry overlay）----
+        def on_double_click(event):
+            if tree.identify_region(event.x, event.y) != "cell":
+                return
+            if tree.identify_column(event.x) != "#3":
+                return
+            row = tree.identify_row(event.y)
+            if not row:
+                return
+            idx = int(row)
+            bbox = tree.bbox(row, "#3")
+            if not bbox:
+                return
+            x, y, w, h = bbox
+            entry = ttk.Entry(tree)
+            entry.place(x=x, y=y, width=w, height=h)
+            entry.insert(0, working[idx]["name"])
+            entry.select_range(0, "end")
+            entry.focus_set()
+
+            def commit(_e=None):
+                new_name = entry.get().strip()
+                if new_name:
+                    working[idx]["name"] = new_name
+                entry.destroy()
+                refresh(select_iid=row)
+
+            entry.bind("<Return>", commit)
+            entry.bind("<FocusOut>", commit)
+            entry.bind("<Escape>", lambda e: entry.destroy())
+
+        tree.bind("<Double-Button-1>", on_double_click)
+
+        # ====== 控制列：全選 / 全不選 / 恢復預設 ==============================
+        ctl = ttk.Frame(top)
+        ctl.pack(fill="x", padx=8, pady=4)
+
+        def do_check_all():
+            for c in working:
+                c["enabled"] = True
+            refresh()
+
+        def do_uncheck_all():
+            for c in working:
+                c["enabled"] = False
+            refresh()
+
+        def do_reset():
+            working.clear()
+            working.extend(self._default_export_cols())
+            refresh()
+
+        ttk.Button(ctl, text="全選 ☑", command=do_check_all).pack(side="left")
+        ttk.Button(ctl, text="全不選 ☐", command=do_uncheck_all).pack(side="left", padx=(4, 0))
+        ttk.Button(ctl, text="恢復預設", command=do_reset).pack(side="left", padx=(16, 0))
+
+        # ====== 套用 / 取消 ===================================================
+        bottom = ttk.Frame(top)
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+
+        def apply_and_close():
+            self._export_cols = [dict(c) for c in working]
+            self._apply_export_cols_change()
+            # 紀錄目前下拉選的 preset 名（讓下次開啟還記得）
+            current_pick = preset_var.get()
+            preset_to_save = "" if current_pick == DEFAULT_LABEL else current_pick
+            if not save_export_cols(self._export_cols, preset_name=preset_to_save):
+                messagebox.showwarning(
+                    "設定無法儲存",
+                    "欄位設定已套用，但寫入 export_cols.json 失敗，下次開啟會回到預設。",
+                )
+            top.destroy()
+
+        ttk.Button(bottom, text="取消", command=top.destroy).pack(side="right")
+        ttk.Button(bottom, text="套用", command=apply_and_close).pack(side="right", padx=(0, 8))
+
     @staticmethod
     def _is_success(data: dict) -> bool:
         status = str(data.get("查詢狀態", "")).strip()
         return status == "" or status == "成功"
 
-    @staticmethod
-    def _transform_for_template(data: dict) -> dict:
-        """套用 EXPORT_COLUMNS_TEMPLATE 的 transform 規則，得到顯示/匯出用的 dict。"""
+    def _transform_for_template(self, data: dict) -> dict:
+        """套用目前勾選顯示的欄位設定 + transform，得到顯示/匯出用的 dict。"""
         out = {}
-        for spec in EXPORT_COLUMNS_TEMPLATE:
+        for spec in self._enabled_export_cols():
             name = spec["name"]
             src = spec.get("source")
             tx = spec.get("transform")
@@ -1271,7 +1907,8 @@ class App:
             else:
                 v = view.get(c, "")
                 values.append("" if v is None else str(v))
-        tree.insert("", "end", values=values)
+        # iid = 字串化的 idx，給右鍵選單反查 _results_api_done 用
+        tree.insert("", "end", iid=str(idx), values=values)
 
     def _insert_fail_row(self, tree: ttk.Treeview, data: dict, idx: int) -> None:
         cols = list(tree["columns"])
@@ -1282,7 +1919,7 @@ class App:
             else:
                 v = data.get(c, "")
                 values.append("" if v is None else str(v))
-        tree.insert("", "end", values=values, tags=("row",))
+        tree.insert("", "end", iid=str(idx), values=values, tags=("row",))
 
     def _refill_done_tree(self) -> None:
         tree = self.result_tree_api_done
@@ -1416,7 +2053,8 @@ class App:
         if not path:
             return
         try:
-            export_results_template(self._results_api_done, path)
+            export_results_template(self._results_api_done, path,
+                                     columns=self._enabled_export_cols())
             n = len(self._results_api_done)
             self._log(f"已匯出 {n} 筆至 {path}")
             messagebox.showinfo("匯出完成", f"已匯出 {n} 筆至：\n{path}")

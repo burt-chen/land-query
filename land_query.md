@@ -15,16 +15,15 @@
 
 ## 用到的 NLSC API
 
-每筆會打 4 顆 API：
+每筆會打 3 顆 API：
 
 | API | 拿什麼 |
 |---|---|
-| `POST api.nlsc.gov.tw/S09_Ralid/getLandInfoSect` | 土地基本資訊 + 所有人 + 公有土地 |
+| `POST api.nlsc.gov.tw/S09_Ralid/getLandInfoSect` | 土地基本資訊 + 所有人 + 公有土地 + 使用分區/使用地類別 |
 | `GET landmaps.nlsc.gov.tw/S_Maps/qryTileMapIndex` (JSONP) | 地塊中心經緯度 (cx, cy)、地段中文名、地政事務所代碼 |
 | `POST api.nlsc.gov.tw/MapSearch/LocationQuery` | 行政區（含里）、經緯度(度/度分秒)、國土利用現況 |
-| `GET api.nlsc.gov.tw/other/GetLandSecInfoNlsc/{city}/{sect}` | 地段元資料（同段共用快取） |
 
-額外用 `pyproj` 把 WGS84 經緯度換算成 TWD97 投影座標。
+額外用**純 Python TM2 投影**（不依賴 pyproj，省 ~30 MB 打包體積）把 WGS84 (cx, cy) 換算成 TWD97 EPSG:3826 座標，精度與 pyproj 完全一致（< 1 公分）。
 
 > ⚠️ **`LocationQuery` 有個 NLSC 後端怪規則**：同一個 HTTP session 只回第一次完整資料，
 > 之後一律空白。所以這顆 API 每筆都用獨立 `requests.post()` 打、不共用 session，
