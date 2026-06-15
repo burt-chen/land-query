@@ -575,6 +575,8 @@ COLUMN_DESCRIPTIONS: dict[tuple, tuple[str, str]] = {
     ("行政區", None):                  ("LocationQuery 解析", ""),
     ("經緯度(JSONP)", None):           ("qryTileMapIndex cx,cy", "直接組 cx,cy"),
     ("經緯度(度分秒)", None):          ("LocationQuery 解析", ""),
+    ("TWD97_E", None):                 ("從 cx,cy 純 Python 換算", "E 座標(公尺,四捨五入到整數)"),
+    ("TWD97_N", None):                 ("從 cx,cy 純 Python 換算", "N 座標(公尺,四捨五入到整數)"),
     ("TWD97", None):                   ("從 cx,cy 純 Python 換算", "格式 E:xxx N:xxx,EPSG:3826"),
     ("地號(JSONP組合)", None):         ("組合字串", "{所}所({office}{sect}){段}{地號}地號"),
     ("所有人_姓名", None):             ("land.userList[0].name", ""),
@@ -609,6 +611,8 @@ EXPORT_COLUMNS_TEMPLATE = [
     {"name": "行政區",            "source": "行政區"},
     {"name": "經緯度(度)",        "source": "經緯度(JSONP)"},
     {"name": "經緯度(度分秒)",    "source": "經緯度(度分秒)"},
+    {"name": "TWD97(E)",          "source": "TWD97_E"},
+    {"name": "TWD97(N)",          "source": "TWD97_N"},
     {"name": "TWD97",             "source": "TWD97"},  # 純 Python 從 cx,cy 換算（E:xxx N:xxx）
     {"name": "地號",              "source": "地號(JSONP組合)"},
     {"name": "所有權人",          "source": "所有人_姓名"},
@@ -830,6 +834,8 @@ def _api_format_land_record(
         twd97 = _wgs84_to_twd97(tile_index["cx"], tile_index["cy"])
         if twd97:
             e, n = twd97
+            data["TWD97_E"] = int(round(e))
+            data["TWD97_N"] = int(round(n))
             data["TWD97"] = f"E:{int(round(e))} N:{int(round(n))}"
 
     # 從 tile_index 組出 3 個衍生字串欄位（給 EXPORT_COLUMNS_TEMPLATE 用）
@@ -1387,7 +1393,8 @@ class App:
         "面積": 80, "使用分區": 80, "使用地類別": 100,
         "登記日期": 150, "公告現值": 130, "公告地價": 130, "權利人類別": 100,
         "地籍連結": 320, "行政區": 200,
-        "經緯度(度)": 180, "經緯度(度分秒)": 200, "TWD97": 160,
+        "經緯度(度)": 180, "經緯度(度分秒)": 200,
+        "TWD97(E)": 100, "TWD97(N)": 110, "TWD97": 160,
         "地號": 280,
         "所有權人": 130, "統一編號": 120, "所有權人類別": 100, "權利範圍類別": 100,
         "權利範圍持分_分母": 120, "權利範圍持分_分子": 120,
