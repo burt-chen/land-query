@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import traceback
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,9 @@ DEFAULT_CONFIG = {
     "api_land_info_url": "https://api.nlsc.gov.tw/S09_Ralid/getLandInfoSect",
     "api_tile_index_url": "https://landmaps.nlsc.gov.tw/S_Maps/qryTileMapIndex",
     "api_location_query_url": "https://api.nlsc.gov.tw/MapSearch/LocationQuery",
+    # 歷年國土利用調查（點查詢）。後面會接 /0/{經度}/{緯度}/4326，回 XML。
+    # 這顆一定要帶 api_referer，不帶或亂帶會回 404 PERMISSION DENIED。
+    "api_land_use_url": "https://api.nlsc.gov.tw/other/LandUsePointYears",
     "api_referer": "https://maps.nlsc.gov.tw/",
     "api_request_timeout": 20,
     "api_request_delay": 0.5,  # 每筆之間的禮貌延遲（太小易被 NLSC 限流，O 欄度分秒會空白）
@@ -575,6 +579,8 @@ COLUMN_DESCRIPTIONS: dict[tuple, tuple[str, str]] = {
     ("行政區", None):                  ("LocationQuery 解析", ""),
     ("經緯度(JSONP)", None):           ("qryTileMapIndex cx,cy", "直接組 cx,cy"),
     ("經緯度(度分秒)", None):          ("LocationQuery 解析", ""),
+    ("國土利用_年月", None):           ("LandUsePointYears 最新一期", "YEAR 年 LMONTH 月"),
+    ("國土利用_現況", None):           ("LandUsePointYears 最新一期", "LCODE-NAME"),
     ("TWD97_E", None):                 ("從 cx,cy 純 Python 換算", "E 座標(公尺,四捨五入到整數)"),
     ("TWD97_N", None):                 ("從 cx,cy 純 Python 換算", "N 座標(公尺,四捨五入到整數)"),
     ("TWD97", None):                   ("從 cx,cy 純 Python 換算", "格式 E:xxx N:xxx,EPSG:3826"),
@@ -611,6 +617,8 @@ EXPORT_COLUMNS_TEMPLATE = [
     {"name": "行政區",            "source": "行政區"},
     {"name": "經緯度(度)",        "source": "經緯度(JSONP)"},
     {"name": "經緯度(度分秒)",    "source": "經緯度(度分秒)"},
+    {"name": "國土利用_年月",     "source": "國土利用_年月"},
+    {"name": "國土利用_現況",     "source": "國土利用_現況"},
     {"name": "TWD97(E)",          "source": "TWD97_E"},
     {"name": "TWD97(N)",          "source": "TWD97_N"},
     {"name": "TWD97",             "source": "TWD97"},  # 純 Python 從 cx,cy 換算（E:xxx N:xxx）
@@ -753,11 +761,66 @@ def _parse_location_query(text: str) -> dict:
     return result
 
 
+def _parse_land_use_years(xml_text: str) -> dict:
+    """解析 LandUsePointYears 回的 XML，取**最新一期**國土利用調查。
+
+    回應長這樣（民國年由小到大，但不保證，所以用 YEAR 取最大的那筆）：
+
+      <root>
+        <ITEM><YEAR>112</YEAR><LYEAR>2023</LYEAR><LMONTH>10</LMONTH>
+              <LCODE>090501</LCODE><NAME>未使用地</NAME>...</ITEM>
+        <ITEM><YEAR>114</YEAR><LYEAR>2025</LYEAR><LMONTH>7</LMONTH>...</ITEM>
+      </root>
+
+    查無資料時是 <root><CONTENT>無任何資料</CONTENT></root>。
+
+    回傳：{'國土利用_年月': '114年7月', '國土利用_現況': '090501-未使用地'}
+    缺欄位就給空字串；整份解析失敗回 {}。
+
+    ⚠️ 不能用 LYEAR 排序：NLSC 資料有瑕疵（民國 95 那筆的 LYEAR 標成 2023），
+       只有 YEAR（民國年）是可信的。
+    """
+    if not xml_text or not xml_text.strip():
+        return {}
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return {}
+
+    latest = None
+    latest_year = None
+    for item in root.findall("ITEM"):
+        raw_year = (item.findtext("YEAR") or "").strip()
+        try:
+            year = int(raw_year)
+        except ValueError:
+            continue
+        if latest_year is None or year > latest_year:
+            latest_year, latest = year, item
+    if latest is None:
+        return {}
+
+    month = (latest.findtext("LMONTH") or "").strip()
+    lcode = (latest.findtext("LCODE") or "").strip()
+    name = (latest.findtext("NAME") or "").strip()
+
+    # 年月：有月份才加「月」（民國 82 那期沒有 LMONTH）
+    ym = f"{latest_year}年{month}月" if month else f"{latest_year}年"
+    # 現況：LCODE-NAME；只有一邊有值就給那一邊
+    if lcode and name:
+        status = f"{lcode}-{name}"
+    else:
+        status = lcode or name
+
+    return {"國土利用_年月": ym, "國土利用_現況": status}
+
+
 def _api_format_land_record(
     row: "PreparedRow",
     payload: dict,
     location_text: str | None = None,
     tile_index: dict | None = None,
+    land_use_xml: str | None = None,
 ) -> dict:
     """把所有 API 回的資料攤平成跟 Selenium 版相容的 dict。"""
     data = {
@@ -865,6 +928,13 @@ def _api_format_land_record(
         except Exception:
             pass
 
+    # 歷年國土利用調查（LandUsePointYears）— 只取最新一期的年月 + 現況
+    data["國土利用_年月"] = ""
+    data["國土利用_現況"] = ""
+    if land_use_xml:
+        for k, v in _parse_land_use_years(land_use_xml).items():
+            data[k] = v
+
     return data
 
 
@@ -876,10 +946,11 @@ def run_api_query(
     should_stop: Callable[[], bool],
     on_row: Callable[[dict], None] | None = None,
 ) -> list[dict]:
-    """純 API 查詢，每筆會打 3 顆 API：
+    """純 API 查詢，每筆會打 4 顆 API：
       1. getLandInfoSect — 土地基本資訊 + 所有人 + 公有土地
-      2. qryTileMapIndex — 地塊中心經緯度（給 LocationQuery 用）
+      2. qryTileMapIndex — 地塊中心經緯度（給 3、4 用）
       3. LocationQuery — 行政區 + 經緯度(度/度分秒) + 國土利用
+      4. LandUsePointYears — 歷年國土利用調查（取最新一期的年月 + 現況）
     """
     import requests
     import urllib3
@@ -901,30 +972,44 @@ def run_api_query(
     land_url = cfg.get("api_land_info_url", DEFAULT_CONFIG["api_land_info_url"])
     tile_url = cfg.get("api_tile_index_url", DEFAULT_CONFIG["api_tile_index_url"])
     loc_url = cfg.get("api_location_query_url", DEFAULT_CONFIG["api_location_query_url"])
+    landuse_url = cfg.get("api_land_use_url", DEFAULT_CONFIG["api_land_use_url"])
 
-    def get_tile_index(office: str, sect: str, landno8: str) -> dict | None:
+    def get_tile_index(office: str, sect: str, landno8: str,
+                       trace: list | None = None) -> dict | None:
+        params = {
+            "type": "2", "flag": "2",
+            "office": office, "sect": sect, "landno": landno8,
+            "alpah": "0.5f",
+        }
+        entry = {"seq": 2, "name": "qryTileMapIndex", "method": "GET",
+                 "url": tile_url, "params": dict(params), "raw_key": "_raw_tile"}
+        t0 = time.time()
         try:
-            r = session.get(
-                tile_url,
-                params={
-                    "type": "2", "flag": "2",
-                    "office": office, "sect": sect, "landno": landno8,
-                    "alpah": "0.5f",
-                },
-                timeout=timeout, verify=False,
-            )
+            r = session.get(tile_url, params=params, timeout=timeout, verify=False)
+            entry["elapsed"] = time.time() - t0
+            entry["status"] = r.status_code
+            entry["bytes"] = len(r.content)
+            entry["url"] = r.url
             if r.status_code != 200:
+                entry["error"] = f"HTTP {r.status_code}"
                 return None
             arr = r.json()
             if isinstance(arr, list) and arr:
                 return arr[0]
             if isinstance(arr, dict):
                 return arr
+            entry["error"] = "回應不是預期的 list/dict"
         except Exception as e:
+            entry.setdefault("elapsed", time.time() - t0)
+            entry["error"] = f"{type(e).__name__}: {e}"
             log(f"  qryTileMapIndex 失敗: {type(e).__name__}: {e}")
+        finally:
+            if trace is not None:
+                trace.append(entry)
         return None
 
-    def get_location_query(cx: float, cy: float, max_retry: int = 2) -> str | None:
+    def get_location_query(cx: float, cy: float, max_retry: int = 2,
+                           trace: list | None = None) -> str | None:
         # 注意：LocationQuery 不能跟主 session 共用！
         # NLSC 後端怪規則：同一個 HTTP session 只回第一次完整資料，之後一律空白。
         # 改用一次性 request；空字串回應視為失敗、重試最多 max_retry 次。
@@ -934,23 +1019,73 @@ def run_api_query(
             "User-Agent": session.headers.get("User-Agent", "Mozilla/5.0"),
             "X-Requested-With": "XMLHttpRequest",
         }
-        for attempt in range(max_retry + 1):
-            try:
-                r = requests.post(
-                    loc_url, data={"center": f"{cx},{cy}"},
-                    headers=headers, timeout=timeout, verify=False,
-                )
-                r.encoding = "utf-8"
-                if r.status_code == 200 and r.text.strip():
-                    return r.text
-                # 空字串：等一下再試
-                if attempt < max_retry:
+        params = {"center": f"{cx},{cy}"}
+        entry = {"seq": 3, "name": "LocationQuery", "method": "POST",
+                 "url": loc_url, "params": dict(params),
+                 "raw_key": "_raw_location"}
+        t0 = time.time()
+        try:
+            for attempt in range(max_retry + 1):
+                try:
+                    r = requests.post(
+                        loc_url, data=params,
+                        headers=headers, timeout=timeout, verify=False,
+                    )
+                    r.encoding = "utf-8"
+                    entry["status"] = r.status_code
+                    entry["bytes"] = len(r.content)
+                    if r.status_code == 200 and r.text.strip():
+                        if attempt:
+                            entry["note"] = f"第 {attempt + 1} 次嘗試才成功（前 {attempt} 次空回應）"
+                        return r.text
+                    # 空字串：等一下再試
+                    if attempt < max_retry:
+                        time.sleep(0.5 + attempt * 0.5)
+                    else:
+                        entry["error"] = "空回應（重試 %d 次都沒拿到資料）" % max_retry
+                except Exception as e:
+                    if attempt == max_retry:
+                        entry["error"] = f"{type(e).__name__}: {e}"
+                        log(f"  LocationQuery 失敗 ({type(e).__name__}): {e}")
+                        return None
                     time.sleep(0.5 + attempt * 0.5)
-            except Exception as e:
-                if attempt == max_retry:
-                    log(f"  LocationQuery 失敗 ({type(e).__name__}): {e}")
-                    return None
-                time.sleep(0.5 + attempt * 0.5)
+            return None
+        finally:
+            entry["elapsed"] = time.time() - t0
+            entry["attempts"] = attempt + 1
+            if trace is not None:
+                trace.append(entry)
+
+    def get_land_use_years(cx: float, cy: float,
+                           trace: list | None = None) -> str | None:
+        """歷年國土利用調查（點查詢），回 XML 字串。
+
+        路徑格式：{base}/0/{經度}/{緯度}/4326
+        ⚠️ 這顆一定要帶 Referer（session 已經帶了）；不帶會回 404 PERMISSION DENIED。
+        """
+        url = f"{landuse_url.rstrip('/')}/0/{cx}/{cy}/4326"
+        entry = {"seq": 4, "name": "LandUsePointYears", "method": "GET",
+                 "url": url, "params": None, "raw_key": "_raw_land_use",
+                 "note": "參數在路徑上：/0/{經度}/{緯度}/4326（srid 4326 = WGS84）"}
+        t0 = time.time()
+        try:
+            r = session.get(url, timeout=timeout, verify=False)
+            entry["elapsed"] = time.time() - t0
+            entry["status"] = r.status_code
+            entry["bytes"] = len(r.content)
+            if r.status_code != 200:
+                entry["error"] = f"HTTP {r.status_code}（可能是 Referer 被擋）"
+                log(f"  LandUsePointYears HTTP {r.status_code}（可能是 Referer 被擋）")
+                return None
+            r.encoding = "utf-8"
+            return r.text
+        except Exception as e:
+            entry.setdefault("elapsed", time.time() - t0)
+            entry["error"] = f"{type(e).__name__}: {e}"
+            log(f"  LandUsePointYears 失敗: {type(e).__name__}: {e}")
+        finally:
+            if trace is not None:
+                trace.append(entry)
         return None
 
     all_results: list[dict] = []
@@ -975,6 +1110,10 @@ def run_api_query(
                 "輸入縣市": row.輸入縣市, "輸入行政區": row.輸入行政區,
                 "輸入大段": row.輸入大段, "輸入小段": row.輸入小段, "輸入地號": row.輸入地號,
                 "查詢狀態": f"地號格式異常: {row.landno}",
+                "_api_trace": [{
+                    "seq": 0, "name": "（沒打任何 API）", "skipped": True,
+                    "note": f"地號「{row.landno}」轉不成 8 碼格式，在送出前就擋下來了",
+                }],
             }
             all_results.append(data)
             if on_row:
@@ -985,22 +1124,38 @@ def run_api_query(
         log(f"查詢第 {idx + 1}/{total} 筆: {row.輸入縣市} {row.輸入行政區} {row.輸入大段}{row.輸入小段} {row.landno}  (API)")
 
         # --- 1. 主資料 ---
+        # trace：這一筆打了哪幾顆 API、送什麼參數、回什麼，給右鍵「API 原始回應」用
+        trace: list[dict] = []
+        land_params = {"city": row.city, "sect": row.section, "landno": landno8}
+        land_entry = {"seq": 1, "name": "getLandInfoSect", "method": "POST",
+                      "url": land_url, "params": dict(land_params),
+                      "raw_key": "_raw_payload"}
+        trace.append(land_entry)
+        t0 = time.time()
         try:
             r = session.post(
-                land_url,
-                data={"city": row.city, "sect": row.section, "landno": landno8},
-                timeout=timeout, verify=False,
+                land_url, data=land_params, timeout=timeout, verify=False,
             )
+            land_entry["elapsed"] = time.time() - t0
+            land_entry["status"] = r.status_code
+            land_entry["bytes"] = len(r.content)
             if r.status_code != 200:
                 raise RuntimeError(f"HTTP {r.status_code}")
             payload = r.json()
         except Exception as e:
+            land_entry.setdefault("elapsed", time.time() - t0)
+            land_entry["error"] = f"{type(e).__name__}: {e}"
+            for seq, name in ((2, "qryTileMapIndex"), (3, "LocationQuery"),
+                              (4, "LandUsePointYears")):
+                trace.append({"seq": seq, "name": name, "skipped": True,
+                              "note": "跳過：getLandInfoSect 失敗，這筆不再往下打"})
             data = {
                 "輸入縣市": row.輸入縣市, "輸入行政區": row.輸入行政區,
                 "輸入大段": row.輸入大段, "輸入小段": row.輸入小段, "輸入地號": row.輸入地號,
                 "查詢縣市": row.city, "查詢區": row.area,
                 "查詢地段": row.section, "查詢地號": row.landno,
                 "查詢狀態": f"getLandInfoSect 失敗: {type(e).__name__}: {e}",
+                "_api_trace": trace,
             }
             all_results.append(data)
             if on_row:
@@ -1013,21 +1168,34 @@ def run_api_query(
         # office = row.office（地政事務所代碼，如 'EF' = 岡山）
         # 舊資料 office 可能為空，fallback 用 row.area（雖然會失敗，至少不會 crash）
         office_code = row.office or row.area
-        tile_index = get_tile_index(office_code, row.section, landno8)
+        tile_index = get_tile_index(office_code, row.section, landno8, trace=trace)
 
         # --- 3. LocationQuery 拿行政區/經緯度 ---
         location_text = None
+        land_use_xml = None
         if tile_index and "cx" in tile_index and "cy" in tile_index:
-            location_text = get_location_query(tile_index["cx"], tile_index["cy"])
+            location_text = get_location_query(
+                tile_index["cx"], tile_index["cy"], trace=trace)
+            # --- 4. LandUsePointYears 拿歷年國土利用（取最新一期）---
+            land_use_xml = get_land_use_years(
+                tile_index["cx"], tile_index["cy"], trace=trace)
+        else:
+            # 沒拿到地塊中心座標，3、4 顆沒東西可餵，直接跳過
+            why = ("跳過：qryTileMapIndex 沒回 cx,cy（第 3、4 顆要用這組座標當參數）")
+            for seq, name in ((3, "LocationQuery"), (4, "LandUsePointYears")):
+                trace.append({"seq": seq, "name": name, "skipped": True, "note": why})
 
         # --- 攤平 ---
-        data = _api_format_land_record(row, payload, location_text, tile_index)
+        data = _api_format_land_record(
+            row, payload, location_text, tile_index, land_use_xml)
 
-        # 保留 3 顆 API 的原始回應，給 GUI 右鍵「檢視 API 回應」用
+        # 保留 4 顆 API 的原始回應，給 GUI 右鍵「檢視 API 回應」用
         # 用底線開頭，export_results_template 不會誤抓到（它只看 EXPORT_COLUMNS_TEMPLATE）
         data["_raw_payload"] = payload
         data["_raw_tile"] = tile_index
         data["_raw_location"] = location_text
+        data["_raw_land_use"] = land_use_xml
+        data["_api_trace"] = trace
 
         if not (payload.get("ralid") or payload.get("land", {}).get("userList")):
             data["查詢狀態"] = "查無資料"
@@ -1467,7 +1635,7 @@ class App:
         hbar.grid(row=1, column=0, sticky="ew")
         if kind == "fail":
             tree.tag_configure("row", background="#fdecea")
-        # 右鍵 → 彈視窗顯示這筆的 3 顆 API 原始回應
+        # 右鍵 → 彈視窗顯示這筆的 4 顆 API 原始回應
         tree.bind("<Button-3>", lambda e, k=kind: self._on_result_right_click(e, k))
         return frame, tree
 
@@ -1486,11 +1654,29 @@ class App:
         if 0 < idx <= len(results):
             self._show_raw_api_response(results[idx - 1])
 
+    # 每顆 API 的說明，給彈窗標題用
+    _API_NOTES = {
+        "getLandInfoSect":   "土地基本資訊 + 所有人 + 公有土地",
+        "qryTileMapIndex":   "地塊中心經緯度 + 地段中文名",
+        "LocationQuery":     "行政區 + 經緯度(度/度分秒) + 國土利用",
+        "LandUsePointYears": "歷年國土利用調查（匯出的是最新一期）",
+    }
+
+    @staticmethod
+    def _format_trace_body(data: dict, entry: dict) -> str:
+        """把一筆 trace 的回應內容取出來（從 data 的 _raw_* 欄位）。"""
+        raw = data.get(entry.get("raw_key") or "")
+        if raw is None or raw == "":
+            return ""
+        if isinstance(raw, (dict, list)):
+            return json.dumps(raw, ensure_ascii=False, indent=2)
+        return str(raw)
+
     def _show_raw_api_response(self, data: dict) -> None:
-        """彈出視窗顯示這筆資料的 3 顆 API 原始回應。"""
+        """彈出視窗顯示這筆資料每顆 API 的請求參數 + 原始回應。"""
         top = tk.Toplevel(self.root)
-        top.title("API 原始回應")
-        top.geometry("900x700")
+        top.title("API 呼叫明細")
+        top.geometry("960x760")
 
         head = (
             f"{data.get('輸入縣市','')} {data.get('輸入行政區','')} "
@@ -1504,38 +1690,84 @@ class App:
         txt = ScrolledText(top, wrap="word", font=("Consolas", 10))
         txt.pack(fill="both", expand=True, padx=8, pady=4)
 
-        def section(title: str) -> None:
-            txt.insert("end", "=" * 70 + "\n")
-            txt.insert("end", f"{title}\n")
-            txt.insert("end", "=" * 70 + "\n")
-
-        section("1. getLandInfoSect（土地基本資訊 + 所有人 + 公有土地）")
-        payload = data.get("_raw_payload")
-        if payload is None:
-            txt.insert("end", "(無資料 — 此筆 API 失敗或尚未呼叫，看「查詢狀態」)\n")
+        trace = data.get("_api_trace")
+        if not trace:
+            # 舊結果（這版之前查的）沒有 trace，退回只顯示回應
+            txt.insert("end", "（這筆沒有呼叫紀錄，可能是舊版查詢的結果；只顯示回應）\n\n")
+            for title, key in (
+                ("1. getLandInfoSect", "_raw_payload"),
+                ("2. qryTileMapIndex", "_raw_tile"),
+                ("3. LocationQuery", "_raw_location"),
+                ("4. LandUsePointYears", "_raw_land_use"),
+            ):
+                txt.insert("end", "=" * 74 + "\n" + title + "\n" + "=" * 74 + "\n")
+                body = self._format_trace_body(data, {"raw_key": key})
+                txt.insert("end", (body or "(無資料)") + "\n\n")
+            txt.configure(state="disabled")
         else:
-            txt.insert("end", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-        txt.insert("end", "\n")
+            n_called = sum(1 for e in trace if not e.get("skipped"))
+            total_ms = sum(e.get("elapsed") or 0 for e in trace)
+            txt.insert("end", f"這筆共呼叫 {n_called} 顆 API，合計 {total_ms:.2f} 秒\n\n")
 
-        section("2. qryTileMapIndex（地塊中心 + 地段中文名）")
-        tile = data.get("_raw_tile")
-        if tile is None:
-            txt.insert("end", "(無資料)\n")
-        else:
-            txt.insert("end", json.dumps(tile, ensure_ascii=False, indent=2) + "\n")
-        txt.insert("end", "\n")
+            for e in trace:
+                seq = e.get("seq", "?")
+                name = e.get("name", "?")
+                note_of = self._API_NOTES.get(name, "")
 
-        section("3. LocationQuery（行政區 + 經緯度 + 國土利用）")
-        loc = data.get("_raw_location")
-        if loc is None or loc == "":
-            txt.insert("end", "(無資料)\n")
-        else:
-            txt.insert("end", loc + "\n")
+                # 標題列：狀態圖示 + HTTP 狀態 + 耗時 + 大小
+                if e.get("skipped"):
+                    mark = "⊘ 跳過"
+                elif e.get("error"):
+                    mark = "✗ 失敗"
+                else:
+                    mark = "✓ 成功"
+                bits = []
+                if e.get("status") is not None:
+                    bits.append(f"HTTP {e['status']}")
+                if e.get("elapsed") is not None:
+                    bits.append(f"{e['elapsed']:.2f} 秒")
+                if e.get("bytes") is not None:
+                    bits.append(f"{e['bytes']} bytes")
+                if e.get("attempts", 1) > 1:
+                    bits.append(f"打了 {e['attempts']} 次")
+                tail = ("  (" + ", ".join(bits) + ")") if bits else ""
 
-        txt.configure(state="disabled")
+                txt.insert("end", "=" * 74 + "\n")
+                txt.insert("end", f"{seq}. {name}  {mark}{tail}\n")
+                if note_of:
+                    txt.insert("end", f"   {note_of}\n")
+                txt.insert("end", "=" * 74 + "\n")
+
+                if e.get("skipped"):
+                    txt.insert("end", (e.get("note") or "(跳過)") + "\n\n")
+                    continue
+
+                txt.insert("end", f"[請求] {e.get('method','')} {e.get('url','')}\n")
+                params = e.get("params")
+                if params:
+                    pad = " " * 7
+                    lines = [f"{k} = {v}" for k, v in params.items()]
+                    txt.insert("end", "[參數] " + f"\n{pad}".join(lines) + "\n")
+                if e.get("note"):
+                    txt.insert("end", f"[備註] {e['note']}\n")
+                if e.get("error"):
+                    txt.insert("end", f"[錯誤] {e['error']}\n")
+
+                body = self._format_trace_body(data, e)
+                txt.insert("end", "[回應]\n")
+                txt.insert("end", (body or "(空)") + "\n\n")
+
+            txt.configure(state="disabled")
 
         bottom = ttk.Frame(top)
         bottom.pack(fill="x", padx=8, pady=(0, 8))
+
+        def copy_all():
+            top.clipboard_clear()
+            top.clipboard_append(txt.get("1.0", "end-1c"))
+            messagebox.showinfo("已複製", "整份明細已複製到剪貼簿。", parent=top)
+
+        ttk.Button(bottom, text="複製全部", command=copy_all).pack(side="left")
         ttk.Button(bottom, text="關閉", command=top.destroy).pack(side="right")
         ttk.Button(
             bottom, text="複製全部",
@@ -2125,6 +2357,7 @@ class App:
             ("api_land_info_url", "API: 土地資訊 URL", "str"),
             ("api_tile_index_url", "API: 圖磚索引 URL", "str"),
             ("api_location_query_url", "API: 行政區查詢 URL", "str"),
+            ("api_land_use_url", "API: 歷年國土利用 URL", "str"),
             ("api_request_timeout", "API 等待秒數", "int"),
             ("api_request_delay", "每筆之間延遲秒數", "float"),
         ]

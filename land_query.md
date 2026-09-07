@@ -15,15 +15,20 @@
 
 ## 用到的 NLSC API
 
-每筆會打 3 顆 API：
+每筆會打 4 顆 API：
 
 | API | 拿什麼 |
 |---|---|
 | `POST api.nlsc.gov.tw/S09_Ralid/getLandInfoSect` | 土地基本資訊 + 所有人 + 公有土地 + 使用分區/使用地類別 |
 | `GET landmaps.nlsc.gov.tw/S_Maps/qryTileMapIndex` (JSONP) | 地塊中心經緯度 (cx, cy)、地段中文名、地政事務所代碼 |
 | `POST api.nlsc.gov.tw/MapSearch/LocationQuery` | 行政區（含里）、經緯度(度/度分秒)、國土利用現況 |
+| `GET api.nlsc.gov.tw/other/LandUsePointYears/0/{經度}/{緯度}/4326` | 歷年國土利用調查（回 XML），取最新一期的年月 + 現況 |
 
 額外用**純 Python TM2 投影**（不依賴 pyproj，省 ~30 MB 打包體積）把 WGS84 (cx, cy) 換算成 TWD97 EPSG:3826 座標，精度與 pyproj 完全一致（< 1 公分）。
+
+> ⚠️ **`LandUsePointYears` 一定要帶 `Referer`**（`api_referer` 設定值）。不帶、或帶非 NLSC 的
+> 網域，會回 `404 PERMISSION DENIED`。另外三顆不帶 header 也能通，只有這顆會擋。
+> 它回的是 `application/xml`（不是 JSON），查無資料時是 `<root><CONTENT>無任何資料</CONTENT></root>`。
 
 > ⚠️ **`LocationQuery` 有個 NLSC 後端怪規則**：同一個 HTTP session 只回第一次完整資料，
 > 之後一律空白。所以這顆 API 每筆都用獨立 `requests.post()` 打、不共用 session，
@@ -35,7 +40,7 @@
 |---|---|
 | 1. 檔案 | 選輸入檔 `input.xlsx`、預設輸出位置 |
 | 2. 預覽 | 下載地段代碼表 + 對碼 + 驗證；分子分頁顯示「可查詢／找不到代碼／地號格式錯誤」 |
-| 3. 執行 | 開始 / 停止 / 重試有問題的 / 匯出 Excel / 清空，含 ✓ 完成 / ✗ 有問題 兩個結果分頁 |
+| 3. 執行 | 開始 / 停止 / 重試有問題的 / 匯出 Excel / 清空，含 ✓ 完成 / ✗ 有問題 兩個結果分頁；結果列**右鍵**看該筆的「API 呼叫明細」 |
 | 4. 日誌 | 即時 timestamped 訊息 |
 | 5. 設定 | 讀寫 `config.json`：API 端點、逾時、每筆延遲、地號 regex |
 
@@ -56,21 +61,38 @@
 | `api_sec_info_url` | GetLandSecInfoNlsc | API 端點 |
 | `api_tile_index_url` | qryTileMapIndex | API 端點 |
 | `api_location_query_url` | LocationQuery | API 端點 |
+| `api_land_use_url` | LandUsePointYears | API 端點（後面會自動接 `/0/{經度}/{緯度}/4326`） |
 | `api_referer` | `https://maps.nlsc.gov.tw/` | API 必須帶的 Referer |
 | `api_request_timeout` | `20` | 單次 API 等待秒數 |
 | `api_request_delay` | `0.5` | 每筆之間延遲（太小會被 NLSC 限流，O 欄度分秒會空白） |
 
-## 匯出 Excel 欄位（32 欄）
+## 查一筆為什麼是這個結果：API 呼叫明細
+
+在「3. 執行」的結果列上**右鍵**，會彈出這一筆的完整呼叫紀錄：每顆 API 的
+
+- **請求**：method + 完整 URL（GET 的含 query string）
+- **參數**：實際送出的每個 key/value
+- **狀態**：✓ 成功 / ✗ 失敗 / ⊘ 跳過，加 HTTP 狀態碼、耗時、回應大小
+- **回應**：原始內容（JSON 排版好、XML 原樣）
+
+被跳過的會寫原因（例如「跳過：getLandInfoSect 失敗，這筆不再往下打」），
+`LocationQuery` 空回應重試也會標「打了 N 次」。右下角「複製全部」可整份貼給別人看。
+
+失敗的那一筆一樣可以右鍵 —— ✗ 有問題分頁的結果也有紀錄，看得到是哪一顆、什麼錯誤。
+
+## 匯出 Excel 欄位（34 欄）
 
 完整對照表見 [api_field_mapping.md](api_field_mapping.md)。
 
-簡列：輸入5欄 / 面積 / 使用分區 / 使用地類別 / 登記日期 / 公告現值 / 公告地價 / 權利人類別 / 地籍連結 / 行政區 / 經緯度(度) / 經緯度(度分秒) / TWD97(E) / TWD97(N) / TWD97 / 地號 / 所有權人 / 統一編號 / 所有權人類別 / 權利範圍類別 / 權利範圍持分_分母 / 權利範圍持分_分子 / 申報地價 / 管理者名稱 / 查詢縣市 / 查詢區 / 查詢地段 / 查詢地號
+簡列：輸入5欄 / 面積 / 使用分區 / 使用地類別 / 登記日期 / 公告現值 / 公告地價 / 權利人類別 / 地籍連結 / 行政區 / 經緯度(度) / 經緯度(度分秒) / 國土利用_年月 / 國土利用_現況 / TWD97(E) / TWD97(N) / TWD97 / 地號 / 所有權人 / 統一編號 / 所有權人類別 / 權利範圍類別 / 權利範圍持分_分母 / 權利範圍持分_分子 / 申報地價 / 管理者名稱 / 查詢縣市 / 查詢區 / 查詢地段 / 查詢地號
 
 **資料處理規則**：
 - `登記日期` `1011018` → `民國101年10月18日`
 - `公告現值` / `公告地價` `3500` → `3500 元/平方公尺`
 - `申報地價` 同上
 - `權利範圍持分_分子/分母` 從 `1/3` 拆出 `1` 與 `3`
+- `國土利用_年月` 取 XML 中 `YEAR` 最大那期 → `114年7月`（`YEAR` 年 + `LMONTH` 月；沒 `LMONTH` 就只給年）
+- `國土利用_現況` 同一期的 `LCODE-NAME` → `090501-未使用地`
 - 來源 API 沒回的欄位（私有地的「管理者名稱」、LocationQuery 失敗的「行政區/經緯度(度分秒)」等）保持空白
 
 要改欄位設定（增刪、改名、換來源、加處理）：直接改 [land_query.py](land_query.py) 上方的 `EXPORT_COLUMNS_TEMPLATE`。
