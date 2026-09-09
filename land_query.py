@@ -945,12 +945,16 @@ def run_api_query(
     progress: Callable[[int, int], None],
     should_stop: Callable[[], bool],
     on_row: Callable[[dict], None] | None = None,
+    enable_land_use: bool = False,
 ) -> list[dict]:
-    """純 API 查詢，每筆會打 4 顆 API：
+    """純 API 查詢，每筆最多打 4 顆 API：
       1. getLandInfoSect — 土地基本資訊 + 所有人 + 公有土地
       2. qryTileMapIndex — 地塊中心經緯度（給 3、4 用）
       3. LocationQuery — 行政區 + 經緯度(度/度分秒) + 國土利用
       4. LandUsePointYears — 歷年國土利用調查（取最新一期的年月 + 現況）
+
+    第 4 顆預設**不打**（`enable_land_use=False`），「國土利用_年月 / _現況」兩欄會空白；
+    要那兩欄才傳 `enable_land_use=True`，每筆約多 0.3 秒（整批約慢一倍）。
     """
     import requests
     import urllib3
@@ -1177,8 +1181,15 @@ def run_api_query(
             location_text = get_location_query(
                 tile_index["cx"], tile_index["cy"], trace=trace)
             # --- 4. LandUsePointYears 拿歷年國土利用（取最新一期）---
-            land_use_xml = get_land_use_years(
-                tile_index["cx"], tile_index["cy"], trace=trace)
+            if enable_land_use:
+                land_use_xml = get_land_use_years(
+                    tile_index["cx"], tile_index["cy"], trace=trace)
+            else:
+                trace.append({
+                    "seq": 4, "name": "LandUsePointYears", "skipped": True,
+                    "note": "跳過：執行分頁沒勾「歷年國土利用」"
+                            "（「國土利用_年月 / _現況」兩欄會空白）",
+                })
         else:
             # 沒拿到地塊中心座標，3、4 顆沒東西可餵，直接跳過
             why = ("跳過：qryTileMapIndex 沒回 cx,cy（第 3、4 顆要用這組座標當參數）")
@@ -1579,7 +1590,10 @@ class App:
         warn = (
             "🧪 直接打 NLSC API（不開瀏覽器）查詢。\n"
             "查詢結果分『完成』與『有問題』兩頁；「重試有問題的」會把成功的搬到『完成』。\n"
-            "下方表格欄位跟匯出 Excel 完全一致。"
+            "下方表格欄位跟匯出 Excel 完全一致；在結果列上按右鍵可看該筆的「API 呼叫明細」。\n"
+            "\n"
+            "☐ 歷年國土利用：勾選才會去抓「國土利用_年月」/「國土利用_現況」兩個欄位。\n"
+            "　　不需要就不需勾選。（會另外抓取歷年國土利用的 API）"
         )
         tk.Label(
             page, text=warn, justify="left", anchor="w",
@@ -1596,6 +1610,12 @@ class App:
         self.btn_retry_api.pack(side="left", padx=(0, 12))
         self.btn_clear_api = ttk.Button(bar, text="清空結果", command=self._do_clear_results_api, state="disabled")
         self.btn_clear_api.pack(side="left")
+        # 勾了才打第 4 顆 API（LandUsePointYears）。預設不勾 —— 多數查詢用不到這兩欄，
+        # 每筆可省約 0.3 秒（整批約快一倍）；沒勾時「國土利用_年月 / _現況」兩欄留白。
+        self._land_use_var = tk.BooleanVar(value=False)
+        self.chk_land_use_api = ttk.Checkbutton(
+            bar, text="歷年國土利用", variable=self._land_use_var)
+        self.chk_land_use_api.pack(side="left", padx=(12, 0))
         self._run_status_api = tk.StringVar(value="待命")
         ttk.Label(bar, textvariable=self._run_status_api).pack(side="left", padx=12)
         # 匯出按鈕 + 欄位設定推到最右
@@ -2207,7 +2227,11 @@ class App:
 
         self._running_api = True
         self._stop_flag_api = False
+        # worker 是另一條 thread，不能直接讀 tk 變數 → 先在主 thread 取值
+        enable_land_use = bool(self._land_use_var.get())
+        self._log(f"[API] 歷年國土利用：{'要查' if enable_land_use else '不查（跳過第 4 顆 API）'}")
         self.btn_start_api.configure(state="disabled")
+        self.chk_land_use_api.configure(state="disabled")
         self.btn_stop_api.configure(state="normal")
         self.btn_retry_api.configure(state="disabled")
         self.btn_export_api.configure(state="disabled")
@@ -2222,6 +2246,7 @@ class App:
                     progress=lambda i, n: self.root.after(0, lambda i=i, n=n: self._on_progress_api(i, n)),
                     should_stop=lambda: self._stop_flag_api,
                     on_row=lambda d: self.root.after(0, lambda d=d: self._append_result_row_api(d)),
+                    enable_land_use=enable_land_use,
                 )
                 self.root.after(0, self._on_run_done_api)
             except StopRequested:
@@ -2307,6 +2332,7 @@ class App:
     def _on_run_done_api(self) -> None:
         self._running_api = False
         self.btn_start_api.configure(state="normal")
+        self.chk_land_use_api.configure(state="normal")
         self.btn_stop_api.configure(state="disabled")
         n_done = len(self._results_api_done)
         n_fail = len(self._results_api_fail)
@@ -2317,6 +2343,7 @@ class App:
     def _on_run_stopped_api(self) -> None:
         self._running_api = False
         self.btn_start_api.configure(state="normal")
+        self.chk_land_use_api.configure(state="normal")
         self.btn_stop_api.configure(state="disabled")
         n_done = len(self._results_api_done)
         n_fail = len(self._results_api_fail)
@@ -2327,6 +2354,7 @@ class App:
     def _on_run_failed_api(self, msg: str) -> None:
         self._running_api = False
         self.btn_start_api.configure(state="normal")
+        self.chk_land_use_api.configure(state="normal")
         self.btn_stop_api.configure(state="disabled")
         self._run_status_api.set("執行失敗")
         self._log(f"[API] 執行失敗：{msg.splitlines()[0]}")
